@@ -1,11 +1,11 @@
-# claude-marketplace
+# antonov-claude-plugins
 
 Публичный маркетплейс плагинов для [Claude Code](https://claude.com/claude-code).
 
 ## Установка маркетплейса
 
 ```
-/plugin marketplace add aantonovg/claude-marketplace
+/plugin marketplace add aantonovg/antonov-claude-plugins
 ```
 
 После добавления плагины из этого репозитория будут доступны в `/plugin` для установки.
