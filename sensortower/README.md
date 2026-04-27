@@ -29,11 +29,25 @@ Sensor Tower MCP-сервер на FastMCP — даёт Claude Code доступ
 /plugin install sensortower@claude-marketplace
 ```
 
-Перед использованием:
+## Переменная окружения
 
+Плагин читает `SENSORTOWER_API_KEY` из окружения **процесса Claude Code на момент старта плагина**, а не из shell внутри сессии. Поэтому переменную нужно задать **до** запуска Claude Code.
+
+**macOS / Linux** — добавить в `~/.zshrc` или `~/.bashrc`:
 ```bash
-export SENSORTOWER_API_KEY=...
+export SENSORTOWER_API_KEY="..."
 ```
+Для GUI-приложения Claude Code на macOS — через `launchctl setenv` или `~/Library/LaunchAgents`.
+
+**Windows (PowerShell)** — постоянная user-переменная:
+```powershell
+[Environment]::SetEnvironmentVariable("SENSORTOWER_API_KEY", "...", "User")
+```
+или через `setx SENSORTOWER_API_KEY "..."` (есть лимит 1024 символа). После — **перезапустить терминал и Claude Code**, в текущем процессе переменная не появится.
+
+**Windows (GUI)** — «Изменение переменных среды текущего пользователя» → New → имя `SENSORTOWER_API_KEY`.
+
+Если ключ не задан, `server.py` стартует, но в stderr будет `⚠️ SENSORTOWER_API_KEY is empty`, и API вернёт 401 на первом же запросе.
 
 ## Состав плагина
 
