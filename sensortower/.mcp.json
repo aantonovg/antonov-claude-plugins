@@ -1,0 +1,10 @@
+{
+  "sensortower": {
+    "type": "stdio",
+    "command": "uv",
+    "args": ["run", "${CLAUDE_PLUGIN_ROOT}/server.py"],
+    "env": {
+      "SENSORTOWER_API_KEY": "${SENSORTOWER_API_KEY}"
+    }
+  }
+}

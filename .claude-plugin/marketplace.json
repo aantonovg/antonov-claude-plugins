@@ -1,0 +1,21 @@
+{
+  "name": "claude-marketplace",
+  "owner": {
+    "name": "Aleksandr Antonov",
+    "email": "antonov.guap@gmail.com",
+    "url": "https://github.com/aantonovg"
+  },
+  "metadata": {
+    "description": "Public marketplace of Claude Code plugins by aantonovg.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "sensortower",
+      "source": "./sensortower",
+      "version": "1.0.0",
+      "description": "Sensor Tower MCP server (FastMCP) — 85 tools for app intelligence: rankings, top apps, app metadata, downloads, revenue, demographics, keywords.",
+      "keywords": ["sensortower", "mcp", "app-intelligence", "aso", "mobile", "analytics"]
+    }
+  ]
+}
