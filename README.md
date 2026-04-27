@@ -21,7 +21,7 @@
 После того как маркетплейс добавлен:
 
 ```
-/plugin install sensortower@claude-plugins
+/plugin install sensortower@claude-settings
 ```
 
 Альтернативно — через интерактивное меню `/plugin` → Discover → выбрать плагин.
