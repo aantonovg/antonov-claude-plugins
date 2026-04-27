@@ -26,7 +26,7 @@ Sensor Tower MCP-сервер на FastMCP — даёт Claude Code доступ
 
 ```
 /plugin marketplace add aantonovg/claude-marketplace
-/plugin install sensortower@aantonovg-marketplace
+/plugin install sensortower@claude-marketplace
 ```
 
 ## Переменная окружения
