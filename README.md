@@ -4,7 +4,7 @@
 
 ## Установка маркетплейса
 
-```bash
+```
 /plugin marketplace add aantonovg/claude-marketplace
 ```
 
@@ -14,7 +14,65 @@
 
 | Плагин | Версия | Описание |
 |--------|--------|----------|
-| [sensortower](./sensortower) | 1.0.0 | Sensor Tower MCP — 85 инструментов app-intelligence: рейтинги, метаданные, выручка, ключевые слова, реклама. |
+| [sensortower](./sensortower) | 1.0.1 | Sensor Tower MCP — 85 инструментов app-intelligence: рейтинги, метаданные, выручка, ключевые слова, реклама. |
+
+## Установка плагина
+
+После того как маркетплейс добавлен:
+
+```
+/plugin install sensortower@claude-marketplace
+```
+
+Альтернативно — через интерактивное меню `/plugin` → Discover → выбрать плагин.
+
+Для `sensortower` дополнительно нужен [`uv`](https://docs.astral.sh/uv/):
+
+- **macOS / Linux:** `curl -LsSf https://astral.sh/uv/install.sh | sh`
+- **Windows (PowerShell):** `irm https://astral.sh/uv/install.ps1 | iex`
+- или через пакетный менеджер: `brew install uv` / `winget install astral-sh.uv` / `scoop install uv`
+
+## Настройка API-ключа (sensortower)
+
+Плагин `sensortower` читает `SENSORTOWER_API_KEY` из окружения **процесса Claude Code на момент его старта** — не из shell внутри сессии. Переменную нужно задать **до** запуска Claude Code и затем перезапустить его.
+
+### macOS / Linux
+
+Добавить в `~/.zshrc` (или `~/.bashrc`):
+
+```bash
+export SENSORTOWER_API_KEY="..."
+```
+
+Для GUI-приложения Claude Code на macOS переменные из `~/.zshrc` могут не подхватиться — тогда:
+
+```bash
+launchctl setenv SENSORTOWER_API_KEY "..."
+```
+
+(или прописать в `~/Library/LaunchAgents/<name>.plist` для постоянного эффекта).
+
+### Windows
+
+PowerShell, постоянная user-переменная (рекомендуется — без лимита длины):
+
+```powershell
+[Environment]::SetEnvironmentVariable("SENSORTOWER_API_KEY", "...", "User")
+```
+
+Альтернатива через `setx` (лимит значения 1024 символа):
+
+```cmd
+setx SENSORTOWER_API_KEY "..."
+```
+
+Через GUI: «Изменение переменных среды текущего пользователя» → New → имя `SENSORTOWER_API_KEY`, значение — ваш ключ.
+
+После любой из команд **перезапустите терминал и Claude Code** — в уже работающем процессе переменная не появится.
+
+### Проверка
+
+Если ключ не задан, `server.py` стартует, но в stderr напишет `⚠️ SENSORTOWER_API_KEY is empty`, и API вернёт 401 на первом запросе.
 
 ## Структура
 

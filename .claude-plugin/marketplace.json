@@ -13,7 +13,7 @@
     {
       "name": "sensortower",
       "source": "./sensortower",
-      "version": "1.0.0",
+      "version": "1.0.1",
       "description": "Sensor Tower MCP server (FastMCP) — 85 tools for app intelligence: rankings, top apps, app metadata, downloads, revenue, demographics, keywords.",
       "keywords": ["sensortower", "mcp", "app-intelligence", "aso", "mobile", "analytics"]
     }

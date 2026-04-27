@@ -10,6 +10,7 @@
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -94,7 +95,7 @@ async def _inject_auth(request: httpx.Request):
 
 
 _INLINE_THRESHOLD = 4000  # chars; larger responses are saved to file
-_DUMP_DIR = Path("/tmp/claude/sensortower")
+_DUMP_DIR = Path(tempfile.gettempdir()) / "claude" / "sensortower"
 
 
 def _smart_response(cleaned: str, request: httpx.Request) -> str:
