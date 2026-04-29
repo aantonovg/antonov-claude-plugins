@@ -1226,6 +1226,30 @@ class LibreOfficeMCPServer:
             "handler": lambda **kw: self.uno_bridge.clone_document(**kw),
         }
 
+        self.tools["read_paragraph_xml"] = {
+            "description": (
+                "Read raw ODT XML for a paragraph at index `paragraph_index` "
+                "in `source_path`, plus all referenced styles (paragraph "
+                "style chain + per-span T-styles from automatic-styles). "
+                "Use when UNO API does NOT surface a property you need to "
+                "replicate — Word→ODT exporters often emit fo:* attributes "
+                "(letter-spacing, break-before, keep-with-next, hyphenate, "
+                "padding) on automatic styles which never round-trip "
+                "through pyuno. paragraph_index matches get_paragraphs "
+                "indexing (body paragraphs only, table cells skipped)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_path": {"type": "string"},
+                    "paragraph_index": {"type": "integer"},
+                    "include_styles": {"type": "boolean", "default": True},
+                },
+                "required": ["source_path", "paragraph_index"],
+            },
+            "handler": lambda **kw: self.uno_bridge.read_paragraph_xml(**kw),
+        }
+
         # export_active_document REMOVED — storeToURL on a visible component blocks
         # the HTTP worker thread on macOS (AppKit UI-thread deadlock) and wedges the
         # entire server until LibreOffice is restarted. Use clone_document for

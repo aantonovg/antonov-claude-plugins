@@ -4272,6 +4272,94 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def read_paragraph_xml(self, source_path: str, paragraph_index: int,
+                           include_styles: bool = True) -> Dict[str, Any]:
+        """Read raw ODT XML for a paragraph and the styles it references.
+
+        UNO paragraph properties surface only resolved values for a fixed
+        set of fields — Word→ODT exporters often emit `fo:*` attributes
+        (letter-spacing, break-before, keep-with-next, hyphenate, etc.)
+        on automatic styles which never round-trip through pyuno. Parsing
+        content.xml + styles.xml directly is the only way to see them.
+
+        Returns:
+          - paragraph_xml: raw `<text:p ... >...</text:p>` or
+            `<text:h ... >...</text:h>` element as a string
+          - style_name: paragraph style ref attribute
+          - styles: dict {style_name: raw_style_xml} for the paragraph's
+            style chain (parent-style-name walked) plus every text-span's
+            referenced T-style. Use this to find fo:* attributes that
+            UNO API hides.
+        """
+        try:
+            import zipfile
+            import re as _re
+            with zipfile.ZipFile(source_path) as zf:
+                with zf.open("content.xml") as f:
+                    content = f.read().decode("utf-8")
+                styles_xml = ""
+                try:
+                    with zf.open("styles.xml") as f:
+                        styles_xml = f.read().decode("utf-8")
+                except KeyError:
+                    pass
+            # Iterate ALL text:p and text:h in body order — same way UNO
+            # _iter_paragraphs does (paragraphs in body, top-level).
+            # Need to skip paragraphs nested INSIDE table cells to match
+            # the index that get_paragraphs returns.
+            # Strategy: strip out <table:table>...</table:table> blocks
+            # before iterating paragraphs (their inner paragraphs are
+            # not body-level).
+            body_only = _re.sub(r'<table:table\b[^>]*>.*?</table:table>',
+                                '<table:table-stub/>', content, flags=_re.DOTALL)
+            # Iterate text:p / text:h — including self-closing variants
+            # (`<text:p .../>` is the ODT representation of an empty
+            # paragraph; without matching them the index drifts by ~44
+            # for a typical Word→ODT export with empty separator paras).
+            iters = list(_re.finditer(
+                r'<text:(p|h)\b[^>]*?(?:/>|>.*?</text:\1>)',
+                body_only, flags=_re.DOTALL))
+            if paragraph_index < 0 or paragraph_index >= len(iters):
+                return {"success": False,
+                        "error": f"index out of range (0..{len(iters)-1})",
+                        "total": len(iters)}
+            para_xml = iters[paragraph_index].group()
+            # Style name on the paragraph
+            sm = _re.search(r'text:style-name="([^"]+)"', para_xml)
+            style_name = sm.group(1) if sm else ""
+            result = {"success": True, "paragraph_index": paragraph_index,
+                      "total_paragraphs": len(iters),
+                      "paragraph_xml": para_xml, "style_name": style_name}
+            if not include_styles:
+                return result
+            # Walk style chain + collect T-styles referenced in spans
+            referenced = {}
+            seen = set()
+            queue = [style_name] if style_name else []
+            # Add T-styles
+            for ts in set(_re.findall(r'<text:span text:style-name="([^"]+)"', para_xml)):
+                queue.append(ts)
+            while queue:
+                sn = queue.pop()
+                if sn in seen:
+                    continue
+                seen.add(sn)
+                pat = _re.compile(rf'<style:style style:name="{_re.escape(sn)}"[^>]*>.*?</style:style>',
+                                  _re.DOTALL)
+                m = pat.search(content) or pat.search(styles_xml)
+                if m:
+                    sxml = m.group()
+                    referenced[sn] = sxml
+                    pm = _re.search(r'style:parent-style-name="([^"]+)"', sxml)
+                    if pm:
+                        queue.append(pm.group(1))
+            result["styles"] = referenced
+            return result
+        except FileNotFoundError:
+            return {"success": False, "error": f"file not found: {source_path!r}"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def export_active_document(self, target_path: str, target_format: str = None) -> Dict[str, Any]:
         """Export the currently active document to a new file via storeToURL.
         Same UI-thread caveat as save_document — kept here as a building block;
