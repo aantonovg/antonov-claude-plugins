@@ -1,0 +1,5 @@
+{
+  "name": "libreoffice",
+  "version": "1.0.0",
+  "description": "Live LibreOffice Writer editing from Claude Code: 55+ MCP tools (paragraphs, styles, find/replace, hyperlinks, comments, tables, headers/footers, undo/redo). Talks to a LibreOffice extension that runs an HTTP API at localhost:8765 inside the editor."
+}

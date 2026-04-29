@@ -15,6 +15,7 @@
 | Плагин | Версия | Описание |
 |--------|--------|----------|
 | [sensortower](./sensortower) | 1.0.1 | Sensor Tower MCP — 85 инструментов app-intelligence: рейтинги, метаданные, выручка, ключевые слова, реклама. |
+| [libreoffice](./libreoffice) | 1.0.0 | Live-редактирование LibreOffice Writer из Claude Code: 55+ инструментов (параграфы, стили, find&replace, гиперссылки, комментарии, таблицы, headers/footers, undo/redo). |
 
 ## Установка плагина
 
@@ -22,15 +23,18 @@
 
 ```
 /plugin install sensortower@antonov-claude-plugins
+/plugin install libreoffice@antonov-claude-plugins
 ```
 
 Альтернативно — через интерактивное меню `/plugin` → Discover → выбрать плагин.
 
-Для `sensortower` дополнительно нужен [`uv`](https://docs.astral.sh/uv/):
+Все плагины используют [`uv`](https://docs.astral.sh/uv/) — поставь его сначала:
 
 - **macOS / Linux:** `curl -LsSf https://astral.sh/uv/install.sh | sh`
 - **Windows (PowerShell):** `irm https://astral.sh/uv/install.ps1 | iex`
 - или через пакетный менеджер: `brew install uv` / `winget install astral-sh.uv` / `scoop install uv`
+
+`libreoffice` дополнительно требует [LibreOffice 24.2+](https://www.libreoffice.org/download/) и однократного запуска инсталлера расширения — см. [libreoffice/README.md](./libreoffice/README.md).
 
 ## Настройка API-ключа (sensortower)
 

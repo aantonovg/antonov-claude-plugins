@@ -16,6 +16,13 @@
       "version": "1.0.1",
       "description": "Sensor Tower MCP server (FastMCP) — 85 tools for app intelligence: rankings, top apps, app metadata, downloads, revenue, demographics, keywords.",
       "keywords": ["sensortower", "mcp", "app-intelligence", "aso", "mobile", "analytics"]
+    },
+    {
+      "name": "libreoffice",
+      "source": "./libreoffice",
+      "version": "1.0.0",
+      "description": "Live LibreOffice Writer editing from Claude Code: 55+ MCP tools (paragraphs, styles, find/replace, hyperlinks, comments, tables, headers/footers, undo/redo) talking to a LibreOffice extension over HTTP localhost:8765.",
+      "keywords": ["libreoffice", "mcp", "writer", "odt", "docx", "office", "uno", "live-editing"]
     }
   ]
 }

@@ -1,0 +1,13 @@
+{
+  "libreoffice-live": {
+    "type": "stdio",
+    "command": "uv",
+    "args": [
+      "run",
+      "--project",
+      "${CLAUDE_PLUGIN_ROOT}",
+      "python",
+      "${CLAUDE_PLUGIN_ROOT}/live_bridge.py"
+    ]
+  }
+}
