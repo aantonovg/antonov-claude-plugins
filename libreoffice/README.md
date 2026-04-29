@@ -57,10 +57,10 @@ winget install astral-sh.uv
 После установки плагина — **один раз** запустить `install.sh`, который ставит расширение в LibreOffice и (на macOS) делает ad-hoc re-sign:
 
 ```bash
-~/.claude/plugins/cache/aantonovg/antonov-claude-plugins/libreoffice/scripts/install.sh
+~/.claude/plugins/cache/antonov-claude-plugins/libreoffice/*/scripts/install.sh
 ```
 
-> Точный путь зависит от расположения plugin cache. Если он другой — найди:
+> Реальный путь содержит версию плагина (например `.../libreoffice/1.0.0/scripts/install.sh`). Если glob не сработает — найди вручную:
 > ```bash
 > find ~/.claude -name "install.sh" -path "*libreoffice*" 2>/dev/null
 > ```
@@ -82,6 +82,7 @@ winget install astral-sh.uv
 2. Поставить prerequisites (см. выше) и расширение в LibreOffice:
    ```bash
    ~/.codex-plugins/antonov-claude-plugins/libreoffice/scripts/install.sh
+   # (в Codex путь без версии — клон лежит как обычный git checkout)
    ```
 
 3. Добавить MCP-сервер в `~/.codex/config.toml`:
@@ -108,18 +109,20 @@ winget install astral-sh.uv
 
 Скрипт идемпотентен — можно перезапускать.
 
-## Доступные MCP-инструменты (60)
+## Доступные MCP-инструменты (65+)
 
 | Категория | Tools |
 |---|---|
-| Создание / открытие | `create_document_live`, `open_document_live`, `list_open_documents`, `list_recent_documents`, `open_recent_document` |
-| Чтение содержимого | `get_text_content_live`, `get_text_at`, `get_paragraphs`, `get_paragraphs_with_runs`, `get_outline`, `get_paragraph_format_at`, `get_character_format`, `get_selection`, `get_document_info_live`, `get_document_summary`, `get_document_metadata`, `get_page_info` |
-| Стили | `list_paragraph_styles`, `list_character_styles`, `apply_paragraph_style` |
+| Создание / открытие / завершение | `create_document_live`, `open_document_live`, `list_open_documents`, `list_recent_documents`, `open_recent_document`, `shutdown_application` (graceful, без recovery dialog) |
+| Чтение содержимого | `get_text_content_live`, `get_text_at`, `get_paragraphs`, `get_paragraphs_with_runs`, `get_outline`, `get_paragraph_format_at`, `get_character_format`, `get_selection`, `get_document_info_live`, `get_document_summary`, `get_document_metadata`, `get_page_info` (margins + header/footer + columns + автодетект `PageDescName` первого параграфа — для Word-import master-pages типа `MP0`) |
+| Стили — чтение | `list_paragraph_styles`, `list_character_styles`, `list_numbering_styles`, `get_paragraph_style_def` (полный snapshot: font/bold/italic/underline/color/char_word_mode/alignment/indents/spacing/line_spacing/tab_stops/context_margin/outline_level/parent/follow) |
+| Стили — запись | `apply_paragraph_style`, `set_paragraph_style_props` (симметрично get_paragraph_style_def), `set_page_style_props` (симметрично get_page_info), `set_page_margins`, `apply_numbering` |
+| Стили — клонирование | `clone_paragraph_style`, `clone_page_style`, `clone_numbering_rule` (быстрая массовая репликация из открытого source-документа) |
 | Поиск | `find_all`, `find_and_replace` |
 | Запись текста | `insert_text_live` (с поддержкой `\n` как paragraph break), `delete_range`, `select_range` |
 | Форматирование текста | `format_text_live` (bold/italic/underline/font_size/font_name), `set_text_color`, `set_background_color` |
-| Параграфы | `set_paragraph_alignment`, `set_paragraph_indent`, `set_line_spacing` |
-| Headers/Footers | `enable_header`/`enable_footer`, `set_header`/`set_footer`, `get_header`/`get_footer` |
+| Параграфы | `set_paragraph_alignment`, `set_paragraph_indent`, `set_paragraph_spacing` (с context_margin), `set_paragraph_tabs`, `set_line_spacing` |
+| Headers/Footers | `enable_header`/`enable_footer`, `set_header`/`set_footer`, `get_header`/`get_footer` (плюс через `set_page_style_props`) |
 | Закладки | `list_bookmarks`, `add_bookmark`, `remove_bookmark` |
 | Гиперссылки | `list_hyperlinks`, `add_hyperlink` |
 | Комментарии | `list_comments`, `add_comment` |
@@ -129,13 +132,12 @@ winget install astral-sh.uv
 | Метаданные | `set_document_metadata` |
 | Undo / Redo | `undo`, `redo`, `get_undo_history` |
 | Конвертация форматов | `clone_document` (file-on-disk, headless: ODT/DOCX/PDF/HTML/RTF/XLSX/...) |
-| Экспорт активного | `export_active_document` (storeToURL, осторожно на macOS) |
-| Батчинг | `execute_batch` (массив операций → один HTTP-вызов / один tool-call для агента) |
-| Низкоуровневое | `dispatch_uno_command` (whitelist из ~66 безопасных команд) |
+| Батчинг / view | `execute_batch` (массив операций → один HTTP-вызов; auto lock/unlock view), `lock_view`, `unlock_view`, `show_window` |
+| Низкоуровневое | `dispatch_uno_command` (whitelist из ~70 безопасных команд, включая `.uno:ControlCodes`/`.uno:SpellOnline` view toggles) |
 
 ## Известные ограничения (macOS)
 
-- **Save через MCP не работает.** `doc.store()`, `doc.storeToURL()` и `.uno:Save` через dispatch на macOS Sequoia блокируются на UI-thread из background-thread HTTP-сервера. **Workflow: агент делает правки → пользователь жмёт Cmd+S** в окне LibreOffice (это работает мгновенно, потому что выполняется в UI-thread). Tools `save_document_live` и `export_document_live` сознательно удалены из набора.
+- **Save / Export через MCP не работает.** `doc.store()`, `doc.storeToURL()` и `.uno:Save` через dispatch на macOS Sequoia блокируются на UI-thread из background-thread HTTP-сервера, причём блок может полностью повесить worker до перезапуска LibreOffice. **Workflow: агент делает правки → пользователь жмёт Cmd+S** в окне LibreOffice (это работает мгновенно, потому что выполняется в UI-thread). Tools `save_document_live`, `export_document_live` и `export_active_document` сознательно удалены из набора (последний — в v1.0.1, после реального инцидента с зависанием). Для конвертации формата используй `clone_document` — он работает через hidden component и не касается UI-thread.
 - **`dispatch_uno_command` ограничен whitelist'ом** ~66 безопасных команд (formatting, navigation, selection, edit). Любая другая команда (включая Save/Export/Print/Open/Close/RunMacro) возвращает `error` без вызова UNO API — гарантия, что сервер не зависнет.
 - **`list_recent_documents`** в текущей версии возвращает индексы вместо URL'ов (структура `Histories/PickList` в LO 26 хитрая). `open_document_live` по абсолютному пути работает безупречно — используй его.
 

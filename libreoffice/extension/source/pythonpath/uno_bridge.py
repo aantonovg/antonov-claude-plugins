@@ -33,7 +33,7 @@ class UNOBridge:
             logger.error(f"Failed to initialize UNO Bridge: {e}")
             raise
     
-    def create_document(self, doc_type: str = "writer") -> Any:
+    def create_document(self, doc_type: str = "writer", visible: bool = True) -> Any:
         """
         Create new document using UNO API
         
@@ -59,21 +59,20 @@ class UNOBridge:
             hidden.Name = "Hidden"
             hidden.Value = True
             doc = self.desktop.loadComponentFromURL(url, "_blank", 0, (hidden,))
-            try:
-                ctrl = doc.getCurrentController()
-                if ctrl is not None:
-                    frame = ctrl.getFrame()
-                    if frame is not None:
-                        win = frame.getContainerWindow()
-                        if win is not None:
-                            win.setVisible(True)
-                        # NOTE: do NOT call frame.activate() / setActiveFrame()
-                        # here — both block on AppKit UI thread on macOS when
-                        # invoked from a background HTTP-server thread. Routing
-                        # writes to the right doc is handled by the
-                        # `_last_active_doc` cache in get_active_document().
-            except Exception as e:
-                logger.warning(f"Created document but could not show window: {e}")
+            if visible:
+                try:
+                    ctrl = doc.getCurrentController()
+                    if ctrl is not None:
+                        frame = ctrl.getFrame()
+                        if frame is not None:
+                            win = frame.getContainerWindow()
+                            if win is not None:
+                                win.setVisible(True)
+                            # NOTE: do NOT call frame.activate() / setActiveFrame()
+                            # here — both block on AppKit UI thread on macOS when
+                            # invoked from a background HTTP-server thread.
+                except Exception as e:
+                    logger.warning(f"Created document but could not show window: {e}")
             # Remember the most recently created/opened doc as a fallback
             # anchor for get_active_document — survives cases where
             # setActiveFrame doesn't take effect immediately.
@@ -179,79 +178,81 @@ class UNOBridge:
             logger.error(f"Failed to get document info: {e}")
             return {"error": str(e)}
     
-    def insert_text(self, text: str, position: Optional[int] = None, doc: Any = None) -> Dict[str, Any]:
-        """
-        Insert text into a document
-        
-        Args:
-            text: Text to insert
-            position: Position to insert at (None for current cursor position)
-            doc: Document to insert into (None for active document)
-            
-        Returns:
-            Result dictionary
+    def insert_text(self, text: str, position=None, doc: Any = None) -> Dict[str, Any]:
+        """Insert text into the active Writer document.
+
+        position:
+          - "end" (default) → append at the end of the document body. Safe for
+            batch generation; not affected by prior select_range calls.
+          - "cursor"        → insert at the current view-cursor position.
+            Note: select_range() moves the view cursor onto the selection,
+            so "cursor" after select_range will insert/replace there.
+          - int             → absolute char offset from the document start.
+
+        '\\n' in `text` is converted to a real paragraph break.
         """
         try:
             if doc is None:
                 doc = self.get_active_document()
-            
             if not doc:
                 return {"success": False, "error": "No active document"}
-            
-            if doc.supportsService("com.sun.star.text.TextDocument"):
-                text_obj = doc.getText()
+            if not doc.supportsService("com.sun.star.text.TextDocument"):
+                return {"success": False, "error": f"Text insertion not supported for {self._get_document_type(doc)}"}
 
-                if position is None:
-                    cursor = doc.getCurrentController().getViewCursor()
-                else:
-                    cursor = text_obj.createTextCursor()
-                    cursor.gotoStart(False)
-                    cursor.goRight(position, False)
+            text_obj = doc.getText()
+            if position is None or position == "end":
+                cursor = text_obj.createTextCursor()
+                cursor.gotoEnd(False)
+                where = "end"
+            elif position == "cursor":
+                cursor = doc.getCurrentController().getViewCursor()
+                where = "cursor"
+            else:
+                try:
+                    pos_int = int(position)
+                except (TypeError, ValueError):
+                    return {"success": False, "error": f"position must be int|'end'|'cursor', got {position!r}"}
+                cursor = text_obj.createTextCursor()
+                cursor.gotoStart(False)
+                cursor.goRight(pos_int, False)
+                where = pos_int
 
-                # com.sun.star.text.ControlCharacter.PARAGRAPH_BREAK = 0
-                # Split on '\n' so newlines become real paragraph breaks
-                # instead of literal characters in one paragraph.
-                parts = text.split("\n")
-                for i, part in enumerate(parts):
-                    if i > 0:
-                        text_obj.insertControlCharacter(cursor, 0, False)
-                    if part:
-                        text_obj.insertString(cursor, part, False)
-                logger.info(f"Inserted {len(text)} characters into Writer document")
-                return {"success": True, "message": f"Inserted {len(text)} characters"}
+            parts = text.split("\n")
+            for i, part in enumerate(parts):
+                if i > 0:
+                    text_obj.insertControlCharacter(cursor, 0, False)
+                if part:
+                    text_obj.insertString(cursor, part, False)
+            logger.info(f"Inserted {len(text)} characters into Writer document at {where}")
+            return {"success": True, "message": f"Inserted {len(text)} characters at {where}"}
 
-            return {"success": False, "error": f"Text insertion not supported for {self._get_document_type(doc)}"}
-                
         except Exception as e:
             logger.error(f"Failed to insert text: {e}")
             return {"success": False, "error": str(e)}
     
-    def format_text(self, formatting: Dict[str, Any], doc: Any = None) -> Dict[str, Any]:
-        """
-        Apply formatting to selected text
-        
-        Args:
-            formatting: Dictionary of formatting options
-            doc: Document to format (None for active document)
-            
-        Returns:
-            Result dictionary
+    def format_text(self, formatting: Dict[str, Any], doc: Any = None,
+                    start=None, end=None) -> Dict[str, Any]:
+        """Apply character formatting to a range.
+
+        If `start` and `end` are given, format that explicit char-range
+        (end-exclusive). Otherwise fall back to the current selection.
+        Pass start/end for batch ops — it doesn't depend on selection state.
         """
         try:
             if doc is None:
                 doc = self.get_active_document()
-            
+
             if not doc or not doc.supportsService("com.sun.star.text.TextDocument"):
                 return {"success": False, "error": "No Writer document available"}
-            
-            # Get current selection
-            selection = doc.getCurrentController().getSelection()
-            if selection.getCount() == 0:
-                return {"success": False, "error": "No text selected"}
-            
-            # Apply formatting to selection
-            text_range = selection.getByIndex(0)
-            
+
+            if start is not None and end is not None:
+                text_range = self._resolve_range(doc, start, end)
+            else:
+                selection = doc.getCurrentController().getSelection()
+                if selection.getCount() == 0:
+                    return {"success": False, "error": "No text selected (and no start/end provided)"}
+                text_range = selection.getByIndex(0)
+
             # Apply various formatting options
             if "bold" in formatting:
                 text_range.CharWeight = 150.0 if formatting["bold"] else 100.0
@@ -416,6 +417,24 @@ class UNOBridge:
             return color
         return int(str(color).lstrip("#"), 16)
 
+    @staticmethod
+    def _encode_tab_stops(stops):
+        align_rev = {0: "left", 1: "center", 2: "right", 3: "decimal"}
+        out = []
+        if not stops:
+            return out
+        for t in stops:
+            try:
+                out.append({
+                    "position_mm": t.Position / 100.0,
+                    "alignment": align_rev.get(t.Alignment, "left"),
+                    "fill_char": chr(t.FillChar) if t.FillChar else " ",
+                    "decimal_char": chr(t.DecimalChar) if t.DecimalChar else ".",
+                })
+            except Exception:
+                continue
+        return out
+
     def _selected_range_or_view_cursor(self, doc):
         """Prefer current selection; fall back to view cursor (paragraph context)."""
         try:
@@ -428,35 +447,60 @@ class UNOBridge:
             pass
         return doc.getCurrentController().getViewCursor()
 
+    def _resolve_range(self, doc, start=None, end=None):
+        """Resolve an explicit char-range into a text cursor, or fall back
+        to the current selection / view cursor.
+
+        - start, end (int) → cursor over [start, end). End-exclusive.
+        - start only       → cursor at single char position (paragraph context).
+        - "end" sentinel for `end` means up to document end.
+        - both None        → selection (if any) else view cursor.
+        """
+        if start is None and end is None:
+            return self._selected_range_or_view_cursor(doc)
+        text = doc.getText()
+        cursor = text.createTextCursor()
+        cursor.gotoStart(False)
+        if start is not None:
+            cursor.goRight(int(start), False)
+        if end == "end":
+            cursor.gotoEnd(True)
+        elif end is not None:
+            length = int(end) - int(start or 0)
+            if length < 0:
+                length = 0
+            cursor.goRight(length, True)
+        return cursor
+
     def _require_writer(self):
         doc = self.get_active_document()
         if not doc or not doc.supportsService("com.sun.star.text.TextDocument"):
             return None, {"success": False, "error": "No Writer document active"}
         return doc, None
 
-    def set_text_color(self, color) -> Dict[str, Any]:
+    def set_text_color(self, color, start=None, end=None) -> Dict[str, Any]:
         doc, err = self._require_writer()
         if err:
             return err
         try:
-            rng = self._selected_range_or_view_cursor(doc)
+            rng = self._resolve_range(doc, start, end)
             rng.CharColor = self._hex_to_int(color)
             return {"success": True, "color": color}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def set_background_color(self, color) -> Dict[str, Any]:
+    def set_background_color(self, color, start=None, end=None) -> Dict[str, Any]:
         doc, err = self._require_writer()
         if err:
             return err
         try:
-            rng = self._selected_range_or_view_cursor(doc)
+            rng = self._resolve_range(doc, start, end)
             rng.CharBackColor = self._hex_to_int(color)
             return {"success": True, "color": color}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def set_paragraph_alignment(self, alignment: str) -> Dict[str, Any]:
+    def set_paragraph_alignment(self, alignment: str, start=None, end=None) -> Dict[str, Any]:
         doc, err = self._require_writer()
         if err:
             return err
@@ -466,18 +510,19 @@ class UNOBridge:
         if val is None:
             return {"success": False, "error": "Unknown alignment, use: left|center|right|justify"}
         try:
-            rng = self._selected_range_or_view_cursor(doc)
+            rng = self._resolve_range(doc, start, end)
             rng.ParaAdjust = val
             return {"success": True, "alignment": alignment}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def set_paragraph_indent(self, left_mm=None, right_mm=None, first_line_mm=None) -> Dict[str, Any]:
+    def set_paragraph_indent(self, left_mm=None, right_mm=None, first_line_mm=None,
+                             start=None, end=None) -> Dict[str, Any]:
         doc, err = self._require_writer()
         if err:
             return err
         try:
-            rng = self._selected_range_or_view_cursor(doc)
+            rng = self._resolve_range(doc, start, end)
             applied = {}
             if left_mm is not None:
                 rng.ParaLeftMargin = int(float(left_mm) * 100)  # 1/100 mm
@@ -492,7 +537,63 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def set_line_spacing(self, mode: str = "proportional", value: float = 100) -> Dict[str, Any]:
+    def set_paragraph_spacing(self, top_mm=None, bottom_mm=None,
+                              context_margin=None,
+                              start=None, end=None) -> Dict[str, Any]:
+        """Set ParaTopMargin / ParaBottomMargin / ParaContextMargin.
+        top_mm/bottom_mm in mm. context_margin (bool): when True, adjacent paragraphs
+        of the same style collapse top/bottom — affects whether spacings stack."""
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            rng = self._resolve_range(doc, start, end)
+            applied = {}
+            if top_mm is not None:
+                rng.ParaTopMargin = int(float(top_mm) * 100)
+                applied["top_mm"] = top_mm
+            if bottom_mm is not None:
+                rng.ParaBottomMargin = int(float(bottom_mm) * 100)
+                applied["bottom_mm"] = bottom_mm
+            if context_margin is not None:
+                rng.ParaContextMargin = bool(context_margin)
+                applied["context_margin"] = bool(context_margin)
+            return {"success": True, "applied": applied}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def set_paragraph_tabs(self, stops, start=None, end=None) -> Dict[str, Any]:
+        """Set ParaTabStops on a paragraph range.
+
+        stops: list of {position_mm: float, alignment: 'left'|'right'|'center'|'decimal',
+                        fill_char: str = ' ', decimal_char: str = '.'}
+        Replaces all existing tab stops for the range.
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        if not isinstance(stops, list):
+            return {"success": False, "error": "stops must be a list"}
+        align_map = {"left": 0, "center": 1, "right": 2, "decimal": 3}
+        try:
+            rng = self._resolve_range(doc, start, end)
+            tab_structs = []
+            for s in stops:
+                t = uno.createUnoStruct("com.sun.star.style.TabStop")
+                t.Position = int(float(s.get("position_mm", 0)) * 100)
+                t.Alignment = align_map.get(str(s.get("alignment","left")).lower(), 0)
+                fill = s.get("fill_char", " ") or " "
+                t.FillChar = ord(fill[0]) if isinstance(fill, str) and fill else 32
+                dec = s.get("decimal_char", ".") or "."
+                t.DecimalChar = ord(dec[0]) if isinstance(dec, str) and dec else 46
+                tab_structs.append(t)
+            rng.ParaTabStops = tuple(tab_structs)
+            return {"success": True, "stops_count": len(tab_structs)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def set_line_spacing(self, mode: str = "proportional", value: float = 100,
+                         start=None, end=None) -> Dict[str, Any]:
         """mode: proportional|minimum|leading|fix; value: % for proportional, mm otherwise."""
         doc, err = self._require_writer()
         if err:
@@ -503,20 +604,462 @@ class UNOBridge:
             ls = uno.createUnoStruct("com.sun.star.style.LineSpacing")
             ls.Mode = mode_val
             ls.Height = int(value) if mode_val == 0 else int(float(value) * 100)
-            rng = self._selected_range_or_view_cursor(doc)
+            rng = self._resolve_range(doc, start, end)
             rng.ParaLineSpacing = ls
             return {"success": True, "mode": mode, "value": value}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def apply_paragraph_style(self, style_name: str) -> Dict[str, Any]:
+    def apply_paragraph_style(self, style_name: str, start=None, end=None,
+                              target: str = None) -> Dict[str, Any]:
+        """Apply paragraph style.
+
+        target:
+          - "last"   → style the LAST paragraph in the document body (use this
+            right after insert_text(... position='end'); avoids the
+            off-by-one-paragraph problem with view-cursor).
+          - None     → use start/end if given, else current selection / view cursor.
+
+        start, end: char range (end-exclusive). All paragraphs touching the
+        range will get the style applied.
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        # Pre-check style exists — gives agent a useful error with the
+        # available list instead of an empty exception.
+        try:
+            para_styles = doc.getStyleFamilies().getByName("ParagraphStyles")
+            if not para_styles.hasByName(style_name):
+                return {"success": False,
+                        "error": f"paragraph style not found: {style_name!r}",
+                        "available": list(para_styles.getElementNames())}
+        except Exception:
+            pass
+        try:
+            if target == "last":
+                rng = None
+                enum = doc.getText().createEnumeration()
+                while enum.hasMoreElements():
+                    el = enum.nextElement()
+                    if el.supportsService("com.sun.star.text.Paragraph"):
+                        rng = el
+            else:
+                rng = self._resolve_range(doc, start, end)
+            if rng is None:
+                return {"success": False, "error": "No paragraph to style"}
+            rng.ParaStyleName = style_name
+            # Report what numbering actually attached — agent can detect when a style
+            # exists by name but has no numbering rules, and decide to call apply_numbering.
+            label = getattr(rng, "ListLabelString", "") or ""
+            try:
+                nr = rng.NumberingRules
+                rule_name = getattr(nr, "Name", "") if nr else ""
+            except Exception:
+                rule_name = ""
+            return {"success": True, "style": style_name, "target": target,
+                    "effective_label": label,
+                    "numbering_rule": rule_name}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def apply_numbering(self, level: int = 0, rule_name: str = None,
+                        restart: bool = False, start_value: int = None,
+                        is_number: bool = True,
+                        start=None, end=None, target: str = None) -> Dict[str, Any]:
+        """Configure auto-numbering on a paragraph (or range of paragraphs).
+
+        - level: numbering depth (0 = top, 1 = sub, ...). UNO uses 0-indexed levels.
+        - rule_name: name of a NumberingStyle (NumberingStyles family) to attach.
+          If None, keeps the current rule (e.g. inherited from paragraph style).
+        - restart: True to restart the counter at this paragraph.
+        - start_value: explicit number to start from (only when restart=True).
+        - is_number: False to skip numbering for this paragraph (in a list).
+        - target: 'last' to operate on the LAST paragraph; otherwise start/end
+          select paragraphs by char range; otherwise current selection / view cursor.
+        """
         doc, err = self._require_writer()
         if err:
             return err
         try:
-            rng = self._selected_range_or_view_cursor(doc)
-            rng.ParaStyleName = style_name
-            return {"success": True, "style": style_name}
+            # Resolve target paragraph(s)
+            if target == "last":
+                rng = None
+                enum = doc.getText().createEnumeration()
+                while enum.hasMoreElements():
+                    el = enum.nextElement()
+                    if el.supportsService("com.sun.star.text.Paragraph"):
+                        rng = el
+            else:
+                rng = self._resolve_range(doc, start, end)
+            if rng is None:
+                return {"success": False, "error": "No paragraph to apply numbering to"}
+
+            applied = {}
+            if rule_name is not None:
+                try:
+                    num_styles = doc.getStyleFamilies().getByName("NumberingStyles")
+                except Exception:
+                    num_styles = None
+                if num_styles is None or not num_styles.hasByName(rule_name):
+                    available = list(num_styles.getElementNames()) if num_styles else []
+                    return {"success": False,
+                            "error": f"numbering rule not found: {rule_name!r}",
+                            "available": available}
+                rng.NumberingRules = num_styles.getByName(rule_name).NumberingRules
+                applied["rule_name"] = rule_name
+
+            rng.NumberingLevel = int(level)
+            rng.NumberingIsNumber = bool(is_number)
+            applied["level"] = int(level)
+            applied["is_number"] = bool(is_number)
+            if restart:
+                rng.ParaIsNumberingRestart = True
+                applied["restart"] = True
+                if start_value is not None:
+                    rng.NumberingStartValue = int(start_value)
+                    applied["start_value"] = int(start_value)
+
+            # Read back the rendered label so the agent can verify
+            label = getattr(rng, "ListLabelString", "") or ""
+            return {"success": True, "applied": applied, "effective_label": label}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def list_numbering_styles(self) -> Dict[str, Any]:
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            fam = doc.getStyleFamilies().getByName("NumberingStyles")
+            return {"success": True, "styles": list(fam.getElementNames())}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def clone_numbering_rule(self, source_path: str, rule_name: str,
+                             target_name: str = None) -> Dict[str, Any]:
+        """Copy a NumberingStyle from a currently-open source doc into the active doc.
+
+        After cloning, you can `apply_numbering(rule_name=target_name, ...)` on a
+        paragraph in the active doc and the auto-numbering will render exactly
+        as in the source doc (same level shapes, prefixes, separators).
+        """
+        import os, unicodedata
+        from urllib.parse import unquote
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            try:
+                want_real = os.path.realpath(source_path)
+                want_nfc = unicodedata.normalize("NFC", want_real)
+            except Exception:
+                want_nfc = source_path
+
+            src_doc = None
+            comps = self.desktop.getComponents()
+            it = comps.createEnumeration()
+            while it.hasMoreElements():
+                c = it.nextElement()
+                u = ""
+                try:
+                    u = c.getURL() if hasattr(c, "getURL") else ""
+                except Exception:
+                    pass
+                if not u or not u.startswith("file://"):
+                    continue
+                try:
+                    local = unquote(u[len("file://"):])
+                    local_real = os.path.realpath(local)
+                    local_nfc = unicodedata.normalize("NFC", local_real)
+                except Exception:
+                    continue
+                if local_nfc == want_nfc:
+                    src_doc = c
+                    break
+            if src_doc is None:
+                return {"success": False,
+                        "error": f"source doc not currently open: {source_path!r}. "
+                                 "Open it first with open_document_live."}
+
+            src_fam = src_doc.getStyleFamilies().getByName("NumberingStyles")
+            if not src_fam.hasByName(rule_name):
+                return {"success": False,
+                        "error": f"rule not found in source: {rule_name!r}",
+                        "source_available": list(src_fam.getElementNames())}
+
+            tgt_name = target_name or rule_name
+            tgt_fam = doc.getStyleFamilies().getByName("NumberingStyles")
+            if tgt_fam.hasByName(tgt_name):
+                tgt_style = tgt_fam.getByName(tgt_name)
+                created = False
+            else:
+                tgt_style = doc.createInstance("com.sun.star.style.NumberingStyle")
+                tgt_fam.insertByName(tgt_name, tgt_style)
+                created = True
+
+            tgt_style.NumberingRules = src_fam.getByName(rule_name).NumberingRules
+            return {"success": True, "rule_name": tgt_name, "created": created,
+                    "source_rule": rule_name, "source_path": source_path}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def _find_open_doc(self, source_path: str):
+        """Walk Desktop.getComponents and find an open doc whose realpath
+        matches source_path (NFC-normalized for macOS). Returns the model or None."""
+        import os, unicodedata
+        from urllib.parse import unquote
+        try:
+            want_real = os.path.realpath(source_path)
+            want_nfc = unicodedata.normalize("NFC", want_real)
+        except Exception:
+            want_nfc = source_path
+        comps = self.desktop.getComponents()
+        it = comps.createEnumeration()
+        while it.hasMoreElements():
+            c = it.nextElement()
+            try:
+                u = c.getURL() if hasattr(c, "getURL") else ""
+            except Exception:
+                u = ""
+            if not u or not u.startswith("file://"):
+                continue
+            try:
+                local = unquote(u[len("file://"):])
+                local_real = os.path.realpath(local)
+                local_nfc = unicodedata.normalize("NFC", local_real)
+            except Exception:
+                continue
+            if local_nfc == want_nfc:
+                return c
+        return None
+
+    def clone_paragraph_style(self, source_path: str, style_name: str,
+                              target_name: str = None,
+                              overwrite: bool = True) -> Dict[str, Any]:
+        """Copy a ParagraphStyle's properties from a currently-open source doc
+        into the active doc.
+
+        Copies font, size, bold/italic/underline, color, alignment, line spacing,
+        paragraph margins/indents, tab stops, outline level, parent style.
+        After cloning, apply_paragraph_style(target_name) inherits the source's
+        layout — useful when source style names exist in target by name only
+        (e.g. fresh LO 'Heading 1' has different defaults than a Word import).
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            src_doc = self._find_open_doc(source_path)
+            if src_doc is None:
+                return {"success": False,
+                        "error": f"source doc not currently open: {source_path!r}. "
+                                 "Open it first with open_document_live."}
+            src_fam = src_doc.getStyleFamilies().getByName("ParagraphStyles")
+            if not src_fam.hasByName(style_name):
+                return {"success": False,
+                        "error": f"style not found in source: {style_name!r}",
+                        "source_available": list(src_fam.getElementNames())}
+            src = src_fam.getByName(style_name)
+            tgt_name = target_name or style_name
+            tgt_fam = doc.getStyleFamilies().getByName("ParagraphStyles")
+            if tgt_fam.hasByName(tgt_name):
+                if not overwrite:
+                    return {"success": False,
+                            "error": f"target style exists: {tgt_name!r}; pass overwrite=True"}
+                tgt = tgt_fam.getByName(tgt_name)
+                created = False
+            else:
+                tgt = doc.createInstance("com.sun.star.style.ParagraphStyle")
+                tgt_fam.insertByName(tgt_name, tgt)
+                created = True
+
+            # Copy a curated set of properties. Avoid blind setPropertyValue loop —
+            # some props are read-only or interrelated (e.g. CharColor + CharColorTheme),
+            # and writing them in arbitrary order can throw.
+            props = [
+                # Char
+                "CharFontName", "CharHeight", "CharWeight", "CharPosture",
+                "CharUnderline", "CharUnderlineColor", "CharUnderlineHasColor",
+                "CharStrikeout", "CharOverline",
+                "CharColor", "CharBackColor", "CharBackTransparent",
+                "CharContoured", "CharShadowed", "CharRelief",
+                "CharCaseMap", "CharWordMode", "CharKerning", "CharAutoKerning",
+                "CharFontNameAsian", "CharHeightAsian", "CharWeightAsian", "CharPostureAsian",
+                "CharFontNameComplex", "CharHeightComplex", "CharWeightComplex", "CharPostureComplex",
+                "CharLocale", "CharLocaleAsian", "CharLocaleComplex",
+                # Para
+                "ParaAdjust", "ParaLastLineAdjust",
+                "ParaLeftMargin", "ParaRightMargin",
+                "ParaTopMargin", "ParaBottomMargin", "ParaContextMargin",
+                "ParaFirstLineIndent", "ParaIsAutoFirstLineIndent",
+                "ParaLineSpacing",
+                "ParaTabStops",
+                "ParaOrphans", "ParaWidows", "ParaKeepTogether",
+                "ParaSplit",
+                "ParaIsHyphenation", "ParaHyphenationMaxHyphens",
+                "ParaHyphenationMaxLeadingChars", "ParaHyphenationMaxTrailingChars",
+                "ParaRegisterModeActive",
+                # Outline & numbering linkage
+                "OutlineLevel",
+                # Borders & background
+                "TopBorder", "BottomBorder", "LeftBorder", "RightBorder",
+                "BorderDistance", "TopBorderDistance", "BottomBorderDistance",
+                "LeftBorderDistance", "RightBorderDistance",
+                "ParaBackColor", "ParaBackTransparent",
+                # Page break behavior
+                "BreakType", "PageDescName", "PageNumberOffset",
+                # Drop caps
+                "DropCapFormat", "DropCapWholeWord",
+            ]
+            copied = []
+            failed = []
+            for name in props:
+                try:
+                    if not src.getPropertySetInfo().hasPropertyByName(name):
+                        continue
+                    if not tgt.getPropertySetInfo().hasPropertyByName(name):
+                        continue
+                    val = src.getPropertyValue(name)
+                    tgt.setPropertyValue(name, val)
+                    copied.append(name)
+                except Exception as ex:
+                    failed.append({"prop": name, "error": str(ex)})
+            # Parent style — separate, set last
+            try:
+                parent = getattr(src, "ParentStyle", "") or ""
+                if parent:
+                    tgt_fam_names = list(tgt_fam.getElementNames())
+                    if parent in tgt_fam_names:
+                        tgt.ParentStyle = parent
+            except Exception:
+                pass
+
+            return {"success": True, "style_name": tgt_name, "created": created,
+                    "source_style": style_name, "source_path": source_path,
+                    "copied_count": len(copied), "failed_count": len(failed),
+                    "failed_props": failed[:5]}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def clone_page_style(self, source_path: str,
+                         source_style: str = None,
+                         target_style: str = "Default Page Style") -> Dict[str, Any]:
+        """Copy a PageStyle from a currently-open source doc into the active doc.
+
+        Copies page size/orientation, all 4 margins, header/footer enabled+text+margins,
+        column count, footnote area, background. After cloning, the active doc's
+        target page-style renders pages identically to the source's source_style
+        (including header/footer zone reservation visible on the ruler).
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            src_doc = self._find_open_doc(source_path)
+            if src_doc is None:
+                return {"success": False,
+                        "error": f"source doc not currently open: {source_path!r}. "
+                                 "Open it first with open_document_live."}
+            src_fam = src_doc.getStyleFamilies().getByName("PageStyles")
+            if source_style is None:
+                # Pick page-style of source's first paragraph (handles Word-import
+                # 'MP0' etc.) — fall back to the doc's default if unset.
+                pdn = self._first_paragraph_page_style(src_doc)
+                source_style = pdn or "Default Page Style"
+            if not src_fam.hasByName(source_style):
+                # try locale fallbacks
+                for cand in ("Standard", "Default Page Style", "Default Style"):
+                    if src_fam.hasByName(cand):
+                        source_style = cand; break
+                if not src_fam.hasByName(source_style):
+                    return {"success": False,
+                            "error": f"page style not found in source: {source_style!r}",
+                            "source_available": list(src_fam.getElementNames())}
+            src = src_fam.getByName(source_style)
+            tgt_fam = doc.getStyleFamilies().getByName("PageStyles")
+            if not tgt_fam.hasByName(target_style):
+                # locale fallback for target too
+                for cand in ("Default Page Style", "Standard", "Default Style"):
+                    if tgt_fam.hasByName(cand):
+                        target_style = cand; break
+                if not tgt_fam.hasByName(target_style):
+                    return {"success": False,
+                            "error": f"target page style not found: {target_style!r}",
+                            "target_available": list(tgt_fam.getElementNames())}
+            tgt = tgt_fam.getByName(target_style)
+
+            # Header / Footer have to be enabled BEFORE copying their text /
+            # margins, otherwise the slot is null and writes throw.
+            try:
+                if getattr(src, "HeaderIsOn", False):
+                    tgt.HeaderIsOn = True
+            except Exception:
+                pass
+            try:
+                if getattr(src, "FooterIsOn", False):
+                    tgt.FooterIsOn = True
+            except Exception:
+                pass
+
+            props = [
+                "Size", "IsLandscape",
+                "TopMargin", "BottomMargin", "LeftMargin", "RightMargin",
+                "BorderDistance",
+                "BackColor", "BackTransparent",
+                # Header
+                "HeaderIsOn", "HeaderIsDynamicHeight", "HeaderIsShared",
+                "HeaderHeight", "HeaderBodyDistance",
+                "HeaderLeftMargin", "HeaderRightMargin",
+                "HeaderBackColor", "HeaderBackTransparent",
+                # Footer
+                "FooterIsOn", "FooterIsDynamicHeight", "FooterIsShared",
+                "FooterHeight", "FooterBodyDistance",
+                "FooterLeftMargin", "FooterRightMargin",
+                "FooterBackColor", "FooterBackTransparent",
+                # Borders
+                "TopBorder", "BottomBorder", "LeftBorder", "RightBorder",
+                "TopBorderDistance", "BottomBorderDistance",
+                "LeftBorderDistance", "RightBorderDistance",
+                # Footnote area / columns
+                "FootnoteHeight", "FootnoteLineWeight", "FootnoteLineColor",
+                "FootnoteLineRelativeWidth", "FootnoteLineAdjust",
+                "FootnoteLineTextDistance", "FootnoteLineDistance",
+                "TextColumns",
+                "PageStyleLayout",
+                "RegisterModeActive",
+            ]
+            copied = []; failed = []
+            for name in props:
+                try:
+                    if not src.getPropertySetInfo().hasPropertyByName(name): continue
+                    if not tgt.getPropertySetInfo().hasPropertyByName(name): continue
+                    val = src.getPropertyValue(name)
+                    tgt.setPropertyValue(name, val)
+                    copied.append(name)
+                except Exception as ex:
+                    failed.append({"prop": name, "error": str(ex)})
+
+            # Header/Footer text bodies are XText objects — copy via setString
+            try:
+                if getattr(src, "HeaderIsOn", False) and getattr(tgt, "HeaderIsOn", False):
+                    h_txt = src.HeaderText.getString()
+                    tgt.HeaderText.setString(h_txt)
+            except Exception as ex:
+                failed.append({"prop": "HeaderText", "error": str(ex)})
+            try:
+                if getattr(src, "FooterIsOn", False) and getattr(tgt, "FooterIsOn", False):
+                    f_txt = src.FooterText.getString()
+                    tgt.FooterText.setString(f_txt)
+            except Exception as ex:
+                failed.append({"prop": "FooterText", "error": str(ex)})
+
+            return {"success": True, "source_style": source_style,
+                    "target_style": target_style,
+                    "header_enabled": bool(getattr(tgt, "HeaderIsOn", False)),
+                    "footer_enabled": bool(getattr(tgt, "FooterIsOn", False)),
+                    "copied_count": len(copied), "failed_count": len(failed),
+                    "failed_props": failed[:5]}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -607,9 +1150,47 @@ class UNOBridge:
                         entry["left_mm"] = para.ParaLeftMargin / 100.0
                         entry["right_mm"] = para.ParaRightMargin / 100.0
                         entry["first_line_mm"] = para.ParaFirstLineIndent / 100.0
+                        entry["top_mm"] = getattr(para, "ParaTopMargin", 0) / 100.0
+                        entry["bottom_mm"] = getattr(para, "ParaBottomMargin", 0) / 100.0
+                        try:
+                            entry["tab_stops"] = self._encode_tab_stops(para.ParaTabStops)
+                        except Exception:
+                            entry["tab_stops"] = []
                         ls = para.ParaLineSpacing
                         entry["line_spacing"] = {"mode": ["proportional","minimum","leading","fix"][ls.Mode] if ls.Mode in (0,1,2,3) else ls.Mode,
                                                  "value": ls.Height if ls.Mode == 0 else ls.Height / 100.0}
+                        try:
+                            entry["context_margin"] = bool(getattr(para, "ParaContextMargin", False))
+                        except Exception:
+                            entry["context_margin"] = False
+                        # Page style override: paragraphs that start a new page section
+                        # (PageDescName != "") force a different page-style on the
+                        # following pages — agent must read this to reproduce
+                        # multi-page-style docs (e.g. 'First Page' for cover, then
+                        # 'Default').
+                        try:
+                            entry["page_desc_name"] = getattr(para, "PageDescName", "") or ""
+                        except Exception:
+                            entry["page_desc_name"] = ""
+                        try:
+                            bt = getattr(para, "BreakType", 0)
+                            # BreakType is a UNO Enum (com.sun.star.style.BreakType).
+                            # 0=NONE, 1=COLUMN_BEFORE, 2=COLUMN_AFTER, 3=COLUMN_BOTH,
+                            # 4=PAGE_BEFORE, 5=PAGE_AFTER, 6=PAGE_BOTH
+                            if hasattr(bt, "value"):
+                                entry["break_type"] = int(bt.value)
+                            else:
+                                entry["break_type"] = int(bt) if isinstance(bt, (int, float)) else 0
+                        except Exception:
+                            entry["break_type"] = 0
+                        entry["list_label"] = getattr(para, "ListLabelString", "") or ""
+                        entry["numbering_level"] = int(getattr(para, "NumberingLevel", 0) or 0)
+                        entry["numbering_is_number"] = bool(getattr(para, "NumberingIsNumber", False))
+                        try:
+                            nr = para.NumberingRules
+                            entry["numbering_rule_name"] = getattr(nr, "Name", "") if nr else ""
+                        except Exception:
+                            entry["numbering_rule_name"] = ""
                     except Exception as fe:
                         entry["format_error"] = str(fe)
                 out.append(entry)
@@ -714,6 +1295,25 @@ class UNOBridge:
                         entry["style"] = para.ParaStyleName
                         entry["outline_level"] = int(getattr(para, "OutlineLevel", 0) or 0)
                         entry["alignment"] = ["left", "right", "justify", "center"][para.ParaAdjust] if para.ParaAdjust in (0,1,2,3) else str(para.ParaAdjust)
+                        entry["left_mm"] = para.ParaLeftMargin / 100.0
+                        entry["right_mm"] = para.ParaRightMargin / 100.0
+                        entry["first_line_mm"] = para.ParaFirstLineIndent / 100.0
+                        entry["top_mm"] = getattr(para, "ParaTopMargin", 0) / 100.0
+                        entry["bottom_mm"] = getattr(para, "ParaBottomMargin", 0) / 100.0
+                        try:
+                            entry["tab_stops"] = self._encode_tab_stops(para.ParaTabStops)
+                        except Exception:
+                            entry["tab_stops"] = []
+                        # Numbering: agent needs the rendered label and rule name to faithfully
+                        # replicate auto-numbered paragraphs (Heading 1 → '1.', List Paragraph → '2.1.1.')
+                        entry["list_label"] = getattr(para, "ListLabelString", "") or ""
+                        entry["numbering_level"] = int(getattr(para, "NumberingLevel", 0) or 0)
+                        entry["numbering_is_number"] = bool(getattr(para, "NumberingIsNumber", False))
+                        try:
+                            nr = para.NumberingRules
+                            entry["numbering_rule_name"] = getattr(nr, "Name", "") if nr else ""
+                        except Exception:
+                            entry["numbering_rule_name"] = ""
                     except Exception as fe:
                         entry["format_error"] = str(fe)
                 # Enumerate text portions inside the paragraph
@@ -734,7 +1334,10 @@ class UNOBridge:
                             run["font_name"] = portion.CharFontName
                             run["font_size"] = portion.CharHeight
                             run["bold"] = portion.CharWeight >= 150
-                            run["italic"] = portion.CharPosture != 0
+                            # CharPosture: NONE=0, OBLIQUE=1, ITALIC=2, DONTKNOW=4, REVERSE_OBLIQUE=5, REVERSE_ITALIC=6
+                            # Treat only true italic values as italic. OBLIQUE renders slanted but is rare and
+                            # was producing false positives where every body run came back italic=true.
+                            run["italic"] = portion.CharPosture in (2, 6)
                             run["underline"] = portion.CharUnderline != 0
                             run["strike"] = bool(getattr(portion, "CharStrikeout", 0))
                             run["color"] = self._int_to_hex(portion.CharColor)
@@ -776,7 +1379,7 @@ class UNOBridge:
                 "font_name": cursor.CharFontName,
                 "font_size": cursor.CharHeight,
                 "bold": cursor.CharWeight >= 150,
-                "italic": cursor.CharPosture != 0,
+                "italic": cursor.CharPosture in (2, 6),
                 "underline": cursor.CharUnderline != 0,
                 "color": self._int_to_hex(cursor.CharColor),
                 "background_color": self._int_to_hex(cursor.CharBackColor),
@@ -793,6 +1396,173 @@ class UNOBridge:
             para = families.getByName("ParagraphStyles")
             names = list(para.getElementNames())
             return {"success": True, "styles": names, "count": len(names)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_paragraph_style_def(self, style_name: str) -> Dict[str, Any]:
+        """Read the resolved properties of a paragraph style.
+
+        Use this to figure out what 'Heading 1' / 'Body Text' actually looks
+        like in the current doc (font, size, weight, alignment, indents).
+        Lets the agent replicate a style's effect via direct format ops when
+        the source doc's style name doesn't exist in the target doc.
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            families = doc.getStyleFamilies()
+            para = families.getByName("ParagraphStyles")
+            if not para.hasByName(style_name):
+                return {"success": False,
+                        "error": f"style not found: {style_name!r}",
+                        "available": list(para.getElementNames())}
+            st = para.getByName(style_name)
+            align_map_rev = {0: "left", 1: "right", 2: "justify", 3: "center"}
+            posture = getattr(st, "CharPosture", 0)
+            d = {
+                "name": st.Name,
+                "display_name": getattr(st, "DisplayName", st.Name),
+                "parent": getattr(st, "ParentStyle", "") or "",
+                "follow": getattr(st, "FollowStyle", "") or "",
+                "font_name": getattr(st, "CharFontName", None),
+                "font_size": getattr(st, "CharHeight", None),
+                "bold": getattr(st, "CharWeight", 100) >= 150,
+                "italic": posture in (2, 6),
+                "underline": getattr(st, "CharUnderline", 0) != 0,
+                "char_word_mode": bool(getattr(st, "CharWordMode", False)),
+                "alignment": align_map_rev.get(getattr(st, "ParaAdjust", 0), "left"),
+                "left_mm": getattr(st, "ParaLeftMargin", 0) / 100.0,
+                "right_mm": getattr(st, "ParaRightMargin", 0) / 100.0,
+                "first_line_mm": getattr(st, "ParaFirstLineIndent", 0) / 100.0,
+                "top_mm": getattr(st, "ParaTopMargin", 0) / 100.0,
+                "bottom_mm": getattr(st, "ParaBottomMargin", 0) / 100.0,
+                "context_margin": bool(getattr(st, "ParaContextMargin", False)),
+                "outline_level": getattr(st, "OutlineLevel", 0),
+                "keep_together": bool(getattr(st, "ParaKeepTogether", False)),
+                "split_paragraph": bool(getattr(st, "ParaSplit", True)),
+                "orphans": int(getattr(st, "ParaOrphans", 0) or 0),
+                "widows": int(getattr(st, "ParaWidows", 0) or 0),
+            }
+            try:
+                d["color"] = self._int_to_hex(st.CharColor)
+            except Exception:
+                pass
+            try:
+                ls = st.ParaLineSpacing
+                d["line_spacing"] = {
+                    "mode": ["proportional","minimum","leading","fix"][ls.Mode] if ls.Mode in (0,1,2,3) else ls.Mode,
+                    "value": ls.Height if ls.Mode == 0 else ls.Height / 100.0,
+                }
+            except Exception:
+                pass
+            try:
+                d["tab_stops"] = self._encode_tab_stops(st.ParaTabStops)
+            except Exception:
+                d["tab_stops"] = []
+            return {"success": True, "style": d}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def set_paragraph_style_props(self, style_name: str, **props) -> Dict[str, Any]:
+        """Symmetric writer for get_paragraph_style_def. Accepts any subset of:
+        font_name, font_size, bold, italic, underline, color (#RRGGBB), char_word_mode,
+        alignment ('left'|'right'|'justify'|'center'),
+        left_mm, right_mm, first_line_mm, top_mm, bottom_mm, context_margin,
+        line_spacing ({mode, value}), tab_stops (list of {position_mm, alignment, ...}),
+        outline_level, keep_together, split_paragraph, orphans, widows,
+        parent, follow.
+
+        Modifies the style in place — propagates to every paragraph using it.
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            fam = doc.getStyleFamilies().getByName("ParagraphStyles")
+            if not fam.hasByName(style_name):
+                return {"success": False, "error": f"style not found: {style_name!r}",
+                        "available": list(fam.getElementNames())}
+            st = fam.getByName(style_name)
+            applied = {}
+            failed = {}
+            def _try(fn, key, val):
+                try: fn(val); applied[key] = val
+                except Exception as ex: failed[key] = str(ex)
+            if "font_name" in props:
+                _try(lambda v: setattr(st, "CharFontName", v), "font_name", props["font_name"])
+            if "font_size" in props:
+                _try(lambda v: setattr(st, "CharHeight", float(v)), "font_size", props["font_size"])
+            if "bold" in props:
+                _try(lambda v: setattr(st, "CharWeight", 150.0 if v else 100.0), "bold", bool(props["bold"]))
+            if "italic" in props:
+                _try(lambda v: setattr(st, "CharPosture", 2 if v else 0), "italic", bool(props["italic"]))
+            if "underline" in props:
+                _try(lambda v: setattr(st, "CharUnderline", 1 if v else 0), "underline", bool(props["underline"]))
+            if "char_word_mode" in props:
+                _try(lambda v: setattr(st, "CharWordMode", bool(v)), "char_word_mode", bool(props["char_word_mode"]))
+            if "color" in props:
+                _try(lambda v: setattr(st, "CharColor", int(str(v).lstrip("#"), 16)), "color", props["color"])
+            if "alignment" in props:
+                a_map = {"left":0,"right":1,"justify":2,"center":3}
+                v = a_map.get(str(props["alignment"]).lower())
+                if v is not None: _try(lambda x: setattr(st, "ParaAdjust", x), "alignment", v)
+            for k_in, k_out, scale in [
+                ("left_mm","ParaLeftMargin",100),
+                ("right_mm","ParaRightMargin",100),
+                ("first_line_mm","ParaFirstLineIndent",100),
+                ("top_mm","ParaTopMargin",100),
+                ("bottom_mm","ParaBottomMargin",100),
+            ]:
+                if k_in in props:
+                    _try(lambda v: setattr(st, k_out, int(float(v)*scale)), k_in, props[k_in])
+            if "context_margin" in props:
+                _try(lambda v: setattr(st, "ParaContextMargin", bool(v)), "context_margin", props["context_margin"])
+            if "outline_level" in props:
+                _try(lambda v: setattr(st, "OutlineLevel", int(v)), "outline_level", props["outline_level"])
+            if "keep_together" in props:
+                _try(lambda v: setattr(st, "ParaKeepTogether", bool(v)), "keep_together", props["keep_together"])
+            if "split_paragraph" in props:
+                _try(lambda v: setattr(st, "ParaSplit", bool(v)), "split_paragraph", props["split_paragraph"])
+            if "orphans" in props:
+                _try(lambda v: setattr(st, "ParaOrphans", int(v)), "orphans", props["orphans"])
+            if "widows" in props:
+                _try(lambda v: setattr(st, "ParaWidows", int(v)), "widows", props["widows"])
+            if "parent" in props:
+                _try(lambda v: setattr(st, "ParentStyle", v or ""), "parent", props["parent"])
+            if "follow" in props:
+                _try(lambda v: setattr(st, "FollowStyle", v or ""), "follow", props["follow"])
+            if "line_spacing" in props:
+                ls_in = props["line_spacing"] or {}
+                mode_map = {"proportional":0,"minimum":1,"leading":2,"fix":3}
+                mode = mode_map.get(str(ls_in.get("mode","proportional")).lower(), 0)
+                val = float(ls_in.get("value", 100))
+                ls = uno.createUnoStruct("com.sun.star.style.LineSpacing")
+                ls.Mode = mode
+                ls.Height = int(val) if mode == 0 else int(val * 100)
+                _try(lambda v: setattr(st, "ParaLineSpacing", v), "line_spacing", ls_in)
+                try: st.ParaLineSpacing = ls
+                except Exception as ex: failed["line_spacing"] = str(ex)
+            if "tab_stops" in props:
+                stops = props["tab_stops"] or []
+                a_map = {"left":0,"center":1,"right":2,"decimal":3}
+                tab_structs = []
+                try:
+                    for s in stops:
+                        t = uno.createUnoStruct("com.sun.star.style.TabStop")
+                        t.Position = int(float(s.get("position_mm", 0)) * 100)
+                        t.Alignment = a_map.get(str(s.get("alignment","left")).lower(), 0)
+                        fill = s.get("fill_char", " ") or " "
+                        t.FillChar = ord(fill[0]) if isinstance(fill,str) and fill else 32
+                        dec = s.get("decimal_char", ".") or "."
+                        t.DecimalChar = ord(dec[0]) if isinstance(dec,str) and dec else 46
+                        tab_structs.append(t)
+                    st.ParaTabStops = tuple(tab_structs)
+                    applied["tab_stops"] = stops
+                except Exception as ex:
+                    failed["tab_stops"] = str(ex)
+            return {"success": True, "style_name": style_name,
+                    "applied": list(applied.keys()), "failed": failed}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -856,13 +1626,34 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def get_page_info(self) -> Dict[str, Any]:
+    def _first_paragraph_page_style(self, doc) -> str:
+        """Return the PageDescName of the doc's first paragraph, or '' if not set.
+        Word imports often anchor a Master-Page style (e.g. 'MP0') here that
+        differs from 'Default Page Style' / 'Standard'."""
+        try:
+            enum = doc.getText().createEnumeration()
+            while enum.hasMoreElements():
+                el = enum.nextElement()
+                if el.supportsService("com.sun.star.text.Paragraph"):
+                    pdn = getattr(el, "PageDescName", "") or ""
+                    return pdn
+        except Exception:
+            pass
+        return ""
+
+    def get_page_info(self, page_style: str = None) -> Dict[str, Any]:
+        """Page-style metrics. If page_style is None, picks the page-style of
+        the first paragraph (PageDescName) — required for Word-imports where
+        page1 uses a Master-Page (e.g. 'MP0') with different margins from
+        'Default Page Style'/'Standard'."""
         doc, err = self._require_writer()
         if err:
             return err
+        if page_style is None or page_style == "":
+            pdn = self._first_paragraph_page_style(doc)
+            page_style = pdn or "Default Page Style"
         try:
             ctrl = doc.getCurrentController()
-            # PageCount is a property on the model in modern LO, not a controller method
             page_count = None
             try:
                 page_count = doc.getPropertyValue("PageCount")
@@ -872,23 +1663,170 @@ class UNOBridge:
                         page_count = ctrl.getPageCount()
                     except Exception:
                         pass
+            # Fallback: walk page-bound view-cursor jumps
+            if page_count is None:
+                try:
+                    vc = ctrl.getViewCursor()
+                    if hasattr(vc, "jumpToLastPage") and hasattr(vc, "getPage"):
+                        vc.jumpToLastPage()
+                        page_count = vc.getPage()
+                        vc.jumpToFirstPage()
+                except Exception:
+                    pass
             view_cursor = ctrl.getViewCursor()
             current_page = None
             try:
                 current_page = view_cursor.getPage() if hasattr(view_cursor, "getPage") else None
             except Exception:
                 pass
-            # page size — from the resolved default page style
-            width_mm = height_mm = None
+            out = {"success": True, "page_count": page_count, "current_page": current_page}
             try:
-                ps = self._page_style(doc)
+                ps = self._page_style(doc, page_style)
+                out["page_style"] = getattr(ps, "Name", None)
                 size = ps.Size
-                width_mm = size.Width / 100.0
-                height_mm = size.Height / 100.0
+                out["page_width_mm"] = size.Width / 100.0
+                out["page_height_mm"] = size.Height / 100.0
+                out["top_margin_mm"] = getattr(ps, "TopMargin", 0) / 100.0
+                out["bottom_margin_mm"] = getattr(ps, "BottomMargin", 0) / 100.0
+                out["left_margin_mm"] = getattr(ps, "LeftMargin", 0) / 100.0
+                out["right_margin_mm"] = getattr(ps, "RightMargin", 0) / 100.0
+                try:
+                    out["orientation"] = "landscape" if getattr(ps, "IsLandscape", False) else "portrait"
+                except Exception:
+                    pass
+                # Header
+                h_on = bool(getattr(ps, "HeaderIsOn", False))
+                out["header_enabled"] = h_on
+                if h_on:
+                    out["header_height_mm"] = getattr(ps, "HeaderHeight", 0) / 100.0
+                    out["header_body_distance_mm"] = getattr(ps, "HeaderBodyDistance", 0) / 100.0
+                    out["header_left_margin_mm"] = getattr(ps, "HeaderLeftMargin", 0) / 100.0
+                    out["header_right_margin_mm"] = getattr(ps, "HeaderRightMargin", 0) / 100.0
+                    out["header_dynamic_height"] = bool(getattr(ps, "HeaderIsDynamicHeight", False))
+                    out["header_shared"] = bool(getattr(ps, "HeaderIsShared", True))
+                    try: out["header_text"] = ps.HeaderText.getString()
+                    except Exception: out["header_text"] = ""
+                # Footer
+                f_on = bool(getattr(ps, "FooterIsOn", False))
+                out["footer_enabled"] = f_on
+                if f_on:
+                    out["footer_height_mm"] = getattr(ps, "FooterHeight", 0) / 100.0
+                    out["footer_body_distance_mm"] = getattr(ps, "FooterBodyDistance", 0) / 100.0
+                    out["footer_left_margin_mm"] = getattr(ps, "FooterLeftMargin", 0) / 100.0
+                    out["footer_right_margin_mm"] = getattr(ps, "FooterRightMargin", 0) / 100.0
+                    out["footer_dynamic_height"] = bool(getattr(ps, "FooterIsDynamicHeight", False))
+                    out["footer_shared"] = bool(getattr(ps, "FooterIsShared", True))
+                    try: out["footer_text"] = ps.FooterText.getString()
+                    except Exception: out["footer_text"] = ""
+                # Columns
+                try:
+                    cols = ps.TextColumns
+                    out["column_count"] = int(getattr(cols, "ColumnCount", 1) or 1)
+                except Exception:
+                    out["column_count"] = 1
             except Exception:
                 pass
-            return {"success": True, "page_count": page_count, "current_page": current_page,
-                    "page_width_mm": width_mm, "page_height_mm": height_mm}
+            return out
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def set_page_style_props(self, page_style: str = "Default Page Style", **props) -> Dict[str, Any]:
+        """Symmetric writer for get_page_info. Accepts any subset of:
+        page_width_mm, page_height_mm, orientation ('portrait'|'landscape'),
+        top_margin_mm, bottom_margin_mm, left_margin_mm, right_margin_mm,
+        header_enabled, header_height_mm, header_body_distance_mm,
+        header_left_margin_mm, header_right_margin_mm, header_text,
+        footer_enabled, footer_height_mm, footer_body_distance_mm,
+        footer_left_margin_mm, footer_right_margin_mm, footer_text.
+
+        For header/footer text writes — must enable first (or pass header_enabled=True).
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            ps = self._page_style(doc, page_style)
+            applied = {}; failed = {}
+            def _try(fn, key, val):
+                try: fn(val); applied[key] = val
+                except Exception as ex: failed[key] = str(ex)
+            # Page size: prefer setting explicit width/height through Size struct
+            if "page_width_mm" in props or "page_height_mm" in props:
+                try:
+                    sz = ps.Size
+                    if "page_width_mm" in props:
+                        sz.Width = int(float(props["page_width_mm"]) * 100)
+                        applied["page_width_mm"] = props["page_width_mm"]
+                    if "page_height_mm" in props:
+                        sz.Height = int(float(props["page_height_mm"]) * 100)
+                        applied["page_height_mm"] = props["page_height_mm"]
+                    ps.Size = sz
+                except Exception as ex:
+                    failed["size"] = str(ex)
+            if "orientation" in props:
+                _try(lambda v: setattr(ps, "IsLandscape", v == "landscape"),
+                     "orientation", str(props["orientation"]).lower())
+            for k_in, k_out in [
+                ("top_margin_mm","TopMargin"), ("bottom_margin_mm","BottomMargin"),
+                ("left_margin_mm","LeftMargin"), ("right_margin_mm","RightMargin"),
+            ]:
+                if k_in in props:
+                    _try(lambda v: setattr(ps, k_out, int(float(v)*100)), k_in, props[k_in])
+            # Header — must enable first; subsequent text/margin writes need the slot live
+            if "header_enabled" in props:
+                _try(lambda v: setattr(ps, "HeaderIsOn", bool(v)), "header_enabled", bool(props["header_enabled"]))
+            for k_in, k_out in [
+                ("header_height_mm","HeaderHeight"),
+                ("header_body_distance_mm","HeaderBodyDistance"),
+                ("header_left_margin_mm","HeaderLeftMargin"),
+                ("header_right_margin_mm","HeaderRightMargin"),
+            ]:
+                if k_in in props and getattr(ps, "HeaderIsOn", False):
+                    _try(lambda v: setattr(ps, k_out, int(float(v)*100)), k_in, props[k_in])
+            if "header_text" in props and getattr(ps, "HeaderIsOn", False):
+                _try(lambda v: ps.HeaderText.setString(v or ""), "header_text", props["header_text"])
+            # Footer
+            if "footer_enabled" in props:
+                _try(lambda v: setattr(ps, "FooterIsOn", bool(v)), "footer_enabled", bool(props["footer_enabled"]))
+            for k_in, k_out in [
+                ("footer_height_mm","FooterHeight"),
+                ("footer_body_distance_mm","FooterBodyDistance"),
+                ("footer_left_margin_mm","FooterLeftMargin"),
+                ("footer_right_margin_mm","FooterRightMargin"),
+            ]:
+                if k_in in props and getattr(ps, "FooterIsOn", False):
+                    _try(lambda v: setattr(ps, k_out, int(float(v)*100)), k_in, props[k_in])
+            if "footer_text" in props and getattr(ps, "FooterIsOn", False):
+                _try(lambda v: ps.FooterText.setString(v or ""), "footer_text", props["footer_text"])
+            return {"success": True, "page_style": ps.Name,
+                    "applied": list(applied.keys()), "failed": failed}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def set_page_margins(self, top_mm: Optional[float] = None,
+                         bottom_mm: Optional[float] = None,
+                         left_mm: Optional[float] = None,
+                         right_mm: Optional[float] = None,
+                         page_style: str = "Default Page Style") -> Dict[str, Any]:
+        """Set page margins (in mm) on a page style. Only provided fields are
+        modified; others are left as-is. Affects every paragraph using that page
+        style — page margins are NOT a paragraph property.
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            ps = self._page_style(doc, page_style)
+            applied = {}
+            if top_mm is not None:
+                ps.TopMargin = int(float(top_mm) * 100); applied["top_mm"] = top_mm
+            if bottom_mm is not None:
+                ps.BottomMargin = int(float(bottom_mm) * 100); applied["bottom_mm"] = bottom_mm
+            if left_mm is not None:
+                ps.LeftMargin = int(float(left_mm) * 100); applied["left_mm"] = left_mm
+            if right_mm is not None:
+                ps.RightMargin = int(float(right_mm) * 100); applied["right_mm"] = right_mm
+            return {"success": True, "page_style": ps.Name, "applied": applied}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -910,8 +1848,58 @@ class UNOBridge:
         Uses the same Hidden=True workaround as create_document to avoid
         UI-thread deadlock when called from a background HTTP-server thread,
         then makes the window visible.
+
+        Dedup: if a document with the same realpath is already open
+        (NFC/NFD-normalized comparison), focus it instead of opening a duplicate.
         """
         try:
+            import os, unicodedata
+            try:
+                real = os.path.realpath(path)
+                want_nfc = unicodedata.normalize("NFC", real)
+            except Exception:
+                want_nfc = path
+            # Walk all open components, compare normalized URLs
+            try:
+                comps = self.desktop.getComponents()
+                it = comps.createEnumeration()
+                while it.hasMoreElements():
+                    c = it.nextElement()
+                    try:
+                        u = c.getURL() if hasattr(c, "getURL") else ""
+                    except Exception:
+                        u = ""
+                    if not u or not u.startswith("file://"):
+                        continue
+                    try:
+                        from urllib.parse import unquote
+                        local = unquote(u[len("file://"):])
+                        local_real = os.path.realpath(local)
+                        local_nfc = unicodedata.normalize("NFC", local_real)
+                    except Exception:
+                        continue
+                    if local_nfc == want_nfc:
+                        self._last_active_doc = c
+                        try:
+                            ctrl = c.getCurrentController()
+                            if ctrl is not None:
+                                frame = ctrl.getFrame()
+                                if frame is not None:
+                                    win = frame.getContainerWindow()
+                                    if win is not None:
+                                        win.setVisible(True)
+                        except Exception:
+                            pass
+                        return {
+                            "success": True,
+                            "url": u,
+                            "type": self._get_document_type(c),
+                            "readonly": readonly,
+                            "deduplicated": True,
+                        }
+            except Exception as e:
+                logger.warning(f"open_document_live dedup walk failed: {e}")
+
             url = self._path_to_url(path)
             props = []
             hidden = PropertyValue(); hidden.Name = "Hidden"; hidden.Value = True
@@ -1591,6 +2579,12 @@ class UNOBridge:
         ".uno:Delete", ".uno:DelToStartOfWord", ".uno:DelToEndOfWord",
         ".uno:DelToStartOfLine", ".uno:DelToEndOfLine",
         ".uno:DelToStartOfPara", ".uno:DelToEndOfPara",
+        # ---- View toggles (display-only, no modal dialog) ----
+        ".uno:ControlCodes",      # toggle formatting marks (¶, ·, →)
+        ".uno:Marks",             # toggle field shadings
+        ".uno:SpellOnline",       # toggle live spell-check (red waves)
+        ".uno:ViewBounds",        # toggle text boundaries
+        ".uno:ViewFormFields",    # toggle form-field shadings
     }
 
     def dispatch_uno_command(self, command: str, properties: dict = None) -> Dict[str, Any]:
@@ -1821,6 +2815,102 @@ class UNOBridge:
             ow = PropertyValue(); ow.Name = "Overwrite"; ow.Value = True
             doc.storeToURL(dst_url, (f, ow))
             return {"success": True, "target": dst_url, "filter": filter_name}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def lock_view(self) -> Dict[str, Any]:
+        """Freeze view updates (lockControllers).
+
+        Stops the document from dispatching change events to its controllers
+        while a worker thread is mutating it. Keeps the window visible but
+        avoids the macOS SolarMutex contention that triggers a deadlock when
+        a worker thread bursts many writes against a visible doc.
+
+        Pair with unlock_view(). execute_batch() uses these automatically.
+        Re-entrant: lockControllers/unlockControllers maintain a counter.
+        """
+        doc = self.get_active_document()
+        if not doc:
+            return {"success": False, "error": "No active document"}
+        try:
+            doc.lockControllers()
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def unlock_view(self) -> Dict[str, Any]:
+        doc = self.get_active_document()
+        if not doc:
+            return {"success": False, "error": "No active document"}
+        try:
+            doc.unlockControllers()
+            return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def shutdown_application(self, force: bool = False, delay_ms: int = 250) -> Dict[str, Any]:
+        """Cleanly terminate LibreOffice via Desktop.terminate().
+
+        Use this for hot-reload of the extension instead of `pkill -9`. A clean
+        terminate writes the registry/clipboard properly and skips the
+        Document-Recovery dialog on next launch.
+
+        Implementation note: terminate() runs on a delayed background thread so
+        the HTTP response can be flushed first — otherwise the LO process exits
+        before the client gets the reply. force=True clears every doc's Modified
+        flag so terminate() doesn't bail (DESTRUCTIVE — discards unsaved edits).
+        """
+        try:
+            if force:
+                try:
+                    comps = self.desktop.getComponents()
+                    it = comps.createEnumeration()
+                    while it.hasMoreElements():
+                        c = it.nextElement()
+                        try:
+                            if hasattr(c, "setModified"):
+                                c.setModified(False)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            import threading
+            def _terminate():
+                try:
+                    self.desktop.terminate()
+                except Exception:
+                    pass
+            t = threading.Timer(max(0, int(delay_ms)) / 1000.0, _terminate)
+            t.daemon = True
+            t.start()
+            return {"success": True, "scheduled_in_ms": int(delay_ms), "force": force}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def show_window(self) -> Dict[str, Any]:
+        """Make the active document's window visible.
+
+        Use this AFTER finishing a batch of writes on a doc that was created
+        with visible=False, to avoid the macOS SolarMutex contention that
+        happens when a worker thread mutates a visible doc many times in a
+        burst (visible doc → main-thread layout reflow → SolarMutex
+        contention → eventual deadlock).
+        """
+        try:
+            doc = self.get_active_document()
+            if not doc:
+                return {"success": False, "error": "No active document"}
+            ctrl = doc.getCurrentController()
+            if ctrl is None:
+                return {"success": False, "error": "No controller"}
+            frame = ctrl.getFrame()
+            if frame is None:
+                return {"success": False, "error": "No frame"}
+            win = frame.getContainerWindow()
+            if win is None:
+                return {"success": False, "error": "No container window"}
+            win.setVisible(True)
+            return {"success": True}
         except Exception as e:
             return {"success": False, "error": str(e)}
 

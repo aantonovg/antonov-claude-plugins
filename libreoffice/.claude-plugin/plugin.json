@@ -1,5 +1,5 @@
 {
   "name": "libreoffice",
-  "version": "1.0.0",
-  "description": "Live LibreOffice Writer editing from Claude Code: 55+ MCP tools (paragraphs, styles, find/replace, hyperlinks, comments, tables, headers/footers, undo/redo). Talks to a LibreOffice extension that runs an HTTP API at localhost:8765 inside the editor."
+  "version": "1.0.3",
+  "description": "Live LibreOffice Writer editing from Claude Code: 65+ MCP tools with symmetric get/set for paragraph and page styles (Word-import MP0 master pages, header/footer, line spacing, tab stops, context margin), clone_paragraph_style/clone_page_style/clone_numbering_rule for fast bulk replication, batch + view-lock for SolarMutex-safe bursts, graceful shutdown_application (no recovery dialog). Talks to a LibreOffice extension that runs an HTTP API at localhost:8765 inside the editor."
 }

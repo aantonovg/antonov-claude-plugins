@@ -20,8 +20,8 @@
     {
       "name": "libreoffice",
       "source": "./libreoffice",
-      "version": "1.0.0",
-      "description": "Live LibreOffice Writer editing from Claude Code: 55+ MCP tools (paragraphs, styles, find/replace, hyperlinks, comments, tables, headers/footers, undo/redo) talking to a LibreOffice extension over HTTP localhost:8765.",
+      "version": "1.0.3",
+      "description": "Live LibreOffice Writer editing from Claude Code: 65+ MCP tools talking to a LibreOffice extension over HTTP localhost:8765. v1.0.3 adds full symmetric get/set for paragraph and page styles so an agent can faithfully replicate a doc without guessing: get_paragraph_style_def/set_paragraph_style_props expose font/size/bold/italic/underline/color/char_word_mode/alignment/all_indents/line_spacing/tab_stops/context_margin/outline_level/parent/follow; get_page_info/set_page_style_props expose page size/margins/orientation/header+footer (enabled, height, body_distance, margins, text)/columns; get_paragraphs returns page_desc_name + break_type so Word-import master-pages (e.g. MP0) are visible; clone_paragraph_style/clone_page_style/clone_numbering_rule for bulk replication; shutdown_application (graceful Desktop.terminate, no Document-Recovery dialog); .uno:ControlCodes/.uno:SpellOnline added to dispatch allowlist for view toggles. Carries forward v1.0.2: execute_batch auto-locks view (SolarMutex-safe), open_document_live dedups by realpath, create_document_live visible=false.",
       "keywords": ["libreoffice", "mcp", "writer", "odt", "docx", "office", "uno", "live-editing"]
     }
   ]
