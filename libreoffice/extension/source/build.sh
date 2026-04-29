@@ -8,9 +8,9 @@ set -e
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$(cd "$PLUGIN_DIR/.." && pwd)/build"
 EXTENSION_NAME="libreoffice-mcp-extension"
-VERSION="1.0.0"
+VERSION="1.0.3"
 
-echo "🏗️  Building LibreOffice MCP Extension v${VERSION}"
+echo "Building LibreOffice MCP Extension v${VERSION}"
 
 # Create build directory
 echo "📁 Creating build directory..."
@@ -23,8 +23,10 @@ rm -f "$BUILD_DIR/${EXTENSION_NAME}.oxt"
 
 echo "📦 Packaging extension files..."
 
-# Copy LICENSE from repo root for the simple-license registration block
-cp -f "$(dirname "$PLUGIN_DIR")/LICENSE" "$PLUGIN_DIR/LICENSE"
+# LICENSE already lives in $PLUGIN_DIR; refresh from extension/LICENSE if present
+if [ -f "$(dirname "$PLUGIN_DIR")/LICENSE" ]; then
+    cp -f "$(dirname "$PLUGIN_DIR")/LICENSE" "$PLUGIN_DIR/LICENSE"
+fi
 
 # Create the .oxt file (which is just a ZIP archive)
 zip -r "$BUILD_DIR/${EXTENSION_NAME}-${VERSION}.oxt" \

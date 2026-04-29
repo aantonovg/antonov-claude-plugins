@@ -31,39 +31,78 @@ class LibreOfficeMCPServer:
         
         # Document creation tools
         self.tools["create_document_live"] = {
-            "description": "Create a new document in LibreOffice",
+            "description": (
+                "Create a new document in LibreOffice. "
+                "visible=true (default) shows the window immediately. "
+                "Set visible=false BEFORE running a large execute_batch of writes — "
+                "on macOS, mutating a visible doc many times in a burst can deadlock "
+                "the SolarMutex (worker thread mutates → main thread layout reflow → "
+                "contention). Render hidden, then call show_window after the batch."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "doc_type": {
                         "type": "string",
                         "enum": ["writer", "calc", "impress", "draw"],
-                        "description": "Type of document to create",
-                        "default": "writer"
-                    }
-                }
+                        "default": "writer",
+                    },
+                    "visible": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": "False keeps the window hidden — use for batch writes; pair with show_window after.",
+                    },
+                },
             },
-            "handler": self.create_document_live
+            "handler": self.create_document_live,
+        }
+
+        self.tools["show_window"] = {
+            "description": (
+                "Make the active document's window visible. Use after a batch of "
+                "writes on a doc created with visible=false."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+            "handler": lambda: self.uno_bridge.show_window(),
+        }
+
+        self.tools["shutdown_application"] = {
+            "description": (
+                "Cleanly terminate LibreOffice via Desktop.terminate(). Use for "
+                "hot-reload instead of `pkill -9` — clean terminate skips the "
+                "Document-Recovery dialog on next launch. If unsaved docs exist, "
+                "returns terminated=False; pass force=True to discard unsaved "
+                "edits before terminating (DESTRUCTIVE)."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "force": {"type": "boolean", "default": False},
+            }},
+            "handler": lambda force=False: self.uno_bridge.shutdown_application(force),
         }
         
         # Text manipulation tools
         self.tools["insert_text_live"] = {
-            "description": "Insert text into the currently active document",
+            "description": (
+                "Insert text into the active Writer document. '\\n' becomes a real "
+                "paragraph break. `position` controls WHERE to insert: "
+                "'end' (default — append at end of body, safe for batch generation), "
+                "'cursor' (use the live view-cursor — note: select_range moves it, "
+                "so this can land at a previous selection), or an int char offset "
+                "from doc start. After inserting at 'end', the new text is the LAST "
+                "paragraph(s) — pair with apply_paragraph_style(target='last') to "
+                "style the last inserted paragraph."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "text": {
-                        "type": "string",
-                        "description": "Text to insert"
-                    },
+                    "text": {"type": "string", "description": "Text to insert (\\n = paragraph break)"},
                     "position": {
-                        "type": "integer",
-                        "description": "Position to insert at (optional, defaults to cursor position)"
-                    }
+                        "description": "'end' (default), 'cursor', or int char offset from doc start",
+                    },
                 },
-                "required": ["text"]
+                "required": ["text"],
             },
-            "handler": self.insert_text_live
+            "handler": self.insert_text_live,
         }
         
         # Document info tools
@@ -78,33 +117,24 @@ class LibreOfficeMCPServer:
         
         # Text formatting tools
         self.tools["format_text_live"] = {
-            "description": "Apply formatting to selected text in active document",
+            "description": (
+                "Apply character formatting to a range. Pass start/end (char offsets, "
+                "end-exclusive) to format an explicit range — preferred for batch ops. "
+                "Without start/end, formats the current selection."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "bold": {
-                        "type": "boolean",
-                        "description": "Apply bold formatting"
-                    },
-                    "italic": {
-                        "type": "boolean",
-                        "description": "Apply italic formatting"
-                    },
-                    "underline": {
-                        "type": "boolean",
-                        "description": "Apply underline formatting"
-                    },
-                    "font_size": {
-                        "type": "number",
-                        "description": "Font size in points"
-                    },
-                    "font_name": {
-                        "type": "string",
-                        "description": "Font family name"
-                    }
-                }
+                    "bold": {"type": "boolean"},
+                    "italic": {"type": "boolean"},
+                    "underline": {"type": "boolean"},
+                    "font_size": {"type": "number", "description": "Font size in points"},
+                    "font_name": {"type": "string", "description": "Font family name"},
+                    "start": {"type": "integer", "description": "Char offset (incl.)"},
+                    "end": {"type": "integer", "description": "Char offset (excl.)"},
+                },
             },
-            "handler": self.format_text_live
+            "handler": self.format_text_live,
         }
         
         # NOTE: save_document_live / export_document_live were removed —
@@ -135,71 +165,142 @@ class LibreOfficeMCPServer:
         # ---- Extended editing tools (Writer) ---------------------------
 
         self.tools["set_text_color"] = {
-            "description": "Set font color of the current selection (or view-cursor paragraph). Color is hex like '#FF0000' or 'FF0000' or an int.",
+            "description": "Set font color. Pass start/end for explicit char range (preferred for batch). Without them — uses current selection. Color: hex '#FF0000' or int.",
             "parameters": {
                 "type": "object",
-                "properties": {"color": {"type": "string", "description": "Hex color, e.g. '#FF0000'"}},
+                "properties": {
+                    "color": {"type": "string", "description": "Hex color, e.g. '#FF0000'"},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
+                },
                 "required": ["color"],
             },
-            "handler": lambda color: self.uno_bridge.set_text_color(color),
+            "handler": lambda color, start=None, end=None: self.uno_bridge.set_text_color(color, start, end),
         }
 
         self.tools["set_background_color"] = {
-            "description": "Set character background (highlight) color of the current selection.",
+            "description": "Set character background (highlight) color. Pass start/end for explicit char range.",
             "parameters": {
                 "type": "object",
-                "properties": {"color": {"type": "string", "description": "Hex color, e.g. '#FFFF00'. Use -1 for 'no fill'."}},
+                "properties": {
+                    "color": {"type": "string", "description": "Hex color, e.g. '#FFFF00'. Use -1 for 'no fill'."},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
+                },
                 "required": ["color"],
             },
-            "handler": lambda color: self.uno_bridge.set_background_color(color),
+            "handler": lambda color, start=None, end=None: self.uno_bridge.set_background_color(color, start, end),
         }
 
         self.tools["set_paragraph_alignment"] = {
-            "description": "Set paragraph alignment for current selection / cursor paragraph.",
+            "description": "Set paragraph alignment. Pass start/end to target paragraphs by char range; otherwise uses selection / view cursor.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "alignment": {"type": "string", "enum": ["left", "center", "right", "justify"]}
+                    "alignment": {"type": "string", "enum": ["left", "center", "right", "justify"]},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
                 },
                 "required": ["alignment"],
             },
-            "handler": lambda alignment: self.uno_bridge.set_paragraph_alignment(alignment),
+            "handler": lambda alignment, start=None, end=None: self.uno_bridge.set_paragraph_alignment(alignment, start, end),
         }
 
         self.tools["set_paragraph_indent"] = {
-            "description": "Set paragraph indents in millimeters (omit a field to leave it unchanged).",
+            "description": "Set paragraph indents (mm). Pass start/end for explicit range. Omit a field to leave it unchanged.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "left_mm": {"type": "number", "description": "Left indent in mm"},
-                    "right_mm": {"type": "number", "description": "Right indent in mm"},
-                    "first_line_mm": {"type": "number", "description": "First-line indent in mm"},
+                    "left_mm": {"type": "number"},
+                    "right_mm": {"type": "number"},
+                    "first_line_mm": {"type": "number"},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
                 },
             },
             "handler": lambda **kw: self.uno_bridge.set_paragraph_indent(**kw),
         }
 
+        self.tools["set_paragraph_spacing"] = {
+            "description": (
+                "Set paragraph above/below spacing (ParaTopMargin / ParaBottomMargin) "
+                "and ParaContextMargin (when True, adjacent paragraphs of the same "
+                "style collapse top/bottom — controls whether spacings stack). "
+                "Values in mm. Read context_margin via get_paragraphs and replicate it; "
+                "without it, target may add visible gaps between same-style paragraphs."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "top_mm": {"type": "number"},
+                    "bottom_mm": {"type": "number"},
+                    "context_margin": {"type": "boolean"},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
+                },
+            },
+            "handler": lambda **kw: self.uno_bridge.set_paragraph_spacing(**kw),
+        }
+
+        self.tools["set_paragraph_tabs"] = {
+            "description": (
+                "Replace ParaTabStops on a paragraph range. stops is a list of "
+                "{position_mm, alignment: 'left'|'center'|'right'|'decimal', "
+                "fill_char, decimal_char}. Use this to reproduce a right-aligned "
+                "tab in lines like 'Город ... \\t ... дата' where the date is "
+                "pinned to the right margin via a right-tab."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "stops": {"type": "array", "items": {"type": "object"}},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
+                },
+                "required": ["stops"],
+            },
+            "handler": lambda stops, start=None, end=None:
+                self.uno_bridge.set_paragraph_tabs(stops, start, end),
+        }
+
         self.tools["set_line_spacing"] = {
-            "description": "Set line spacing for current paragraph(s). proportional: value=100 single, 150=1.5x, 200=double. fix/minimum/leading: value in mm.",
+            "description": "Set line spacing. proportional: value=100 single, 150=1.5x, 200=double. fix/minimum/leading: value in mm. Pass start/end for explicit range.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "mode": {"type": "string", "enum": ["proportional", "minimum", "leading", "fix"], "default": "proportional"},
-                    "value": {"type": "number", "description": "% for proportional, mm otherwise"},
+                    "value": {"type": "number"},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
                 },
                 "required": ["value"],
             },
-            "handler": lambda mode="proportional", value=100: self.uno_bridge.set_line_spacing(mode, value),
+            "handler": lambda mode="proportional", value=100, start=None, end=None:
+                self.uno_bridge.set_line_spacing(mode, value, start, end),
         }
 
         self.tools["apply_paragraph_style"] = {
-            "description": "Apply a paragraph style by name (e.g. 'Heading 1', 'Heading 2', 'Quotations', 'Default Paragraph Style').",
+            "description": (
+                "Apply a paragraph style by name (e.g. 'Heading 1', 'Heading 2', "
+                "'Quotations', 'Default Paragraph Style'). "
+                "TARGET SELECTION: pass target='last' to style the LAST paragraph "
+                "(use after insert_text(... position='end') — this is the bug-free "
+                "pattern for batch generation). Or pass start/end to style every "
+                "paragraph touching that char range. Without either, uses the "
+                "current selection / view cursor (legacy; depends on UI state)."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"style_name": {"type": "string"}},
+                "properties": {
+                    "style_name": {"type": "string"},
+                    "target": {"type": "string", "enum": ["last"], "description": "'last' = style last paragraph"},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
+                },
                 "required": ["style_name"],
             },
-            "handler": lambda style_name: self.uno_bridge.apply_paragraph_style(style_name),
+            "handler": lambda style_name, target=None, start=None, end=None:
+                self.uno_bridge.apply_paragraph_style(style_name, start, end, target),
         }
 
         self.tools["find_and_replace"] = {
@@ -313,6 +414,210 @@ class LibreOfficeMCPServer:
             "handler": lambda: self.uno_bridge.list_paragraph_styles(),
         }
 
+        self.tools["apply_numbering"] = {
+            "description": (
+                "Configure auto-numbering on a paragraph (or paragraphs in a "
+                "char range). Use this when apply_paragraph_style attaches a "
+                "style by name but the resulting effective_label is empty — "
+                "the style exists in target doc but its numbering rules are "
+                "not configured. Pair with clone_numbering_rule first if the "
+                "rule itself doesn't exist in target. "
+                "level: 0 = top, 1 = sub, etc. (UNO 0-indexed). "
+                "rule_name: NumberingStyle to attach (omit to keep current). "
+                "restart=True + start_value=N to begin a new counter."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "level": {"type": "integer", "default": 0},
+                    "rule_name": {"type": "string"},
+                    "restart": {"type": "boolean", "default": False},
+                    "start_value": {"type": "integer"},
+                    "is_number": {"type": "boolean", "default": True},
+                    "target": {"type": "string", "enum": ["last"]},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
+                },
+            },
+            "handler": lambda **kw: self.uno_bridge.apply_numbering(**kw),
+        }
+
+        self.tools["list_numbering_styles"] = {
+            "description": "List NumberingStyle names available in the active doc. Use to discover what auto-numbering rules exist before apply_numbering / clone_numbering_rule.",
+            "parameters": {"type": "object", "properties": {}},
+            "handler": lambda: self.uno_bridge.list_numbering_styles(),
+        }
+
+        self.tools["clone_numbering_rule"] = {
+            "description": (
+                "Copy a NumberingStyle (with all its level shapes, prefixes, "
+                "separators) from a currently-open source doc into the active "
+                "doc. Required when the source doc uses a custom numbering rule "
+                "that doesn't exist in the freshly-created target. After cloning, "
+                "call apply_numbering(rule_name=...) on each paragraph that "
+                "should follow the rule. The source doc must be already open "
+                "(use open_document_live first)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_path": {"type": "string", "description": "Filesystem path to the open source doc."},
+                    "rule_name": {"type": "string"},
+                    "target_name": {"type": "string", "description": "Name to use in target doc (defaults to rule_name)."},
+                },
+                "required": ["source_path", "rule_name"],
+            },
+            "handler": lambda source_path, rule_name, target_name=None:
+                self.uno_bridge.clone_numbering_rule(source_path, rule_name, target_name),
+        }
+
+        self.tools["clone_paragraph_style"] = {
+            "description": (
+                "Copy a ParagraphStyle (font, size, weight, alignment, indents, "
+                "spacing, line spacing, tab stops, outline level, parent) from a "
+                "currently-open source doc into the active doc. Use when the "
+                "source's paragraph-style name exists in target by name only "
+                "(e.g. fresh LO 'Heading 1' has different defaults than a Word "
+                "import) — without cloning, apply_paragraph_style inherits target "
+                "defaults. Source doc must be open (use open_document_live first)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_path": {"type": "string"},
+                    "style_name": {"type": "string"},
+                    "target_name": {"type": "string", "description": "Name in target doc (defaults to style_name)."},
+                    "overwrite": {"type": "boolean", "default": True},
+                },
+                "required": ["source_path", "style_name"],
+            },
+            "handler": lambda source_path, style_name, target_name=None, overwrite=True:
+                self.uno_bridge.clone_paragraph_style(source_path, style_name, target_name, overwrite),
+        }
+
+        self.tools["clone_page_style"] = {
+            "description": (
+                "Copy a PageStyle (page size, orientation, all 4 margins, "
+                "header/footer enabled+text+heights+margins, columns, footnote "
+                "area, borders, background) from a currently-open source doc "
+                "into the active doc. If source_style is omitted, uses the "
+                "page style of source's first paragraph. Source doc must be open."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_path": {"type": "string"},
+                    "source_style": {"type": "string"},
+                    "target_style": {"type": "string", "default": "Default Page Style"},
+                },
+                "required": ["source_path"],
+            },
+            "handler": lambda source_path, source_style=None, target_style="Default Page Style":
+                self.uno_bridge.clone_page_style(source_path, source_style, target_style),
+        }
+
+        self.tools["get_paragraph_style_def"] = {
+            "description": (
+                "Full paragraph-style snapshot: font_name, font_size, bold, italic, "
+                "underline, color, char_word_mode, alignment, left/right/first_line/"
+                "top/bottom margins (mm), context_margin, line_spacing {mode, value}, "
+                "tab_stops, outline_level, parent, follow, keep_together, "
+                "split_paragraph, orphans, widows. Pair with set_paragraph_style_props "
+                "to write any subset back."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"style_name": {"type": "string"}},
+                "required": ["style_name"],
+            },
+            "handler": lambda style_name: self.uno_bridge.get_paragraph_style_def(style_name),
+        }
+
+        self.tools["set_paragraph_style_props"] = {
+            "description": (
+                "Symmetric writer for get_paragraph_style_def — modifies the style "
+                "in place (propagates to every paragraph using it). Accepts any "
+                "subset of: font_name, font_size, bold, italic, underline, color "
+                "('#RRGGBB'), char_word_mode, alignment ('left'|'right'|'justify'|"
+                "'center'), left_mm, right_mm, first_line_mm, top_mm, bottom_mm, "
+                "context_margin, line_spacing ({mode, value}), tab_stops "
+                "(list of {position_mm, alignment, fill_char, decimal_char}), "
+                "outline_level, keep_together, split_paragraph, orphans, widows, "
+                "parent, follow."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "style_name": {"type": "string"},
+                    "font_name": {"type": "string"},
+                    "font_size": {"type": "number"},
+                    "bold": {"type": "boolean"},
+                    "italic": {"type": "boolean"},
+                    "underline": {"type": "boolean"},
+                    "color": {"type": "string"},
+                    "char_word_mode": {"type": "boolean"},
+                    "alignment": {"type": "string"},
+                    "left_mm": {"type": "number"},
+                    "right_mm": {"type": "number"},
+                    "first_line_mm": {"type": "number"},
+                    "top_mm": {"type": "number"},
+                    "bottom_mm": {"type": "number"},
+                    "context_margin": {"type": "boolean"},
+                    "line_spacing": {"type": "object"},
+                    "tab_stops": {"type": "array"},
+                    "outline_level": {"type": "integer"},
+                    "keep_together": {"type": "boolean"},
+                    "split_paragraph": {"type": "boolean"},
+                    "orphans": {"type": "integer"},
+                    "widows": {"type": "integer"},
+                    "parent": {"type": "string"},
+                    "follow": {"type": "string"},
+                },
+                "required": ["style_name"],
+            },
+            "handler": lambda **kw: self.uno_bridge.set_paragraph_style_props(**kw),
+        }
+
+        self.tools["set_page_style_props"] = {
+            "description": (
+                "Symmetric writer for get_page_info — modifies a page style. "
+                "Accepts any subset of: page_width_mm, page_height_mm, "
+                "orientation ('portrait'|'landscape'), top/bottom/left/right_margin_mm, "
+                "header_enabled, header_height_mm, header_body_distance_mm, "
+                "header_left/right_margin_mm, header_text, "
+                "footer_enabled, footer_height_mm, footer_body_distance_mm, "
+                "footer_left/right_margin_mm, footer_text. Header/footer text and "
+                "margin writes only take effect when the slot is enabled — pass "
+                "header_enabled=True alongside header_text in the same call."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page_style": {"type": "string", "default": "Default Page Style"},
+                    "page_width_mm": {"type": "number"},
+                    "page_height_mm": {"type": "number"},
+                    "orientation": {"type": "string"},
+                    "top_margin_mm": {"type": "number"},
+                    "bottom_margin_mm": {"type": "number"},
+                    "left_margin_mm": {"type": "number"},
+                    "right_margin_mm": {"type": "number"},
+                    "header_enabled": {"type": "boolean"},
+                    "header_height_mm": {"type": "number"},
+                    "header_body_distance_mm": {"type": "number"},
+                    "header_left_margin_mm": {"type": "number"},
+                    "header_right_margin_mm": {"type": "number"},
+                    "header_text": {"type": "string"},
+                    "footer_enabled": {"type": "boolean"},
+                    "footer_height_mm": {"type": "number"},
+                    "footer_body_distance_mm": {"type": "number"},
+                    "footer_left_margin_mm": {"type": "number"},
+                    "footer_right_margin_mm": {"type": "number"},
+                    "footer_text": {"type": "string"},
+                },
+            },
+            "handler": lambda **kw: self.uno_bridge.set_page_style_props(**kw),
+        }
+
         self.tools["list_character_styles"] = {
             "description": "List all character styles available in the active document.",
             "parameters": {"type": "object", "properties": {}},
@@ -336,9 +641,39 @@ class LibreOfficeMCPServer:
         }
 
         self.tools["get_page_info"] = {
-            "description": "Page count, current page, page size (mm) of the active Writer document.",
-            "parameters": {"type": "object", "properties": {}},
-            "handler": lambda: self.uno_bridge.get_page_info(),
+            "description": (
+                "Returns full page metrics of the active Writer doc: page_count, "
+                "current_page, page_width_mm/page_height_mm, top/bottom/left/right "
+                "margins in mm, orientation, page_style name, header/footer enabled "
+                "and dimensions, column_count. If page_style is omitted, picks the "
+                "PageDescName of the first paragraph — important for Word imports "
+                "where page1 uses a Master-Page style (e.g. 'MP0') that differs from "
+                "'Default Page Style'/'Standard'. Use BEFORE replicating layout into "
+                "a fresh target — agent must read source page margins and call "
+                "set_page_margins on the target, otherwise text wraps differently."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "page_style": {"type": "string", "description": "Defaults to first paragraph's PageDescName."},
+            }},
+            "handler": lambda page_style=None: self.uno_bridge.get_page_info(page_style),
+        }
+
+        self.tools["set_page_margins"] = {
+            "description": (
+                "Set page margins (mm) on a page style. Only fields you pass are changed. "
+                "Affects every paragraph using that page style. Pair with get_page_info to "
+                "copy source layout into a target doc."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "top_mm": {"type": "number"},
+                "bottom_mm": {"type": "number"},
+                "left_mm": {"type": "number"},
+                "right_mm": {"type": "number"},
+                "page_style": {"type": "string", "default": "Default Page Style"},
+            }},
+            "handler": lambda top_mm=None, bottom_mm=None, left_mm=None, right_mm=None,
+                              page_style="Default Page Style":
+                self.uno_bridge.set_page_margins(top_mm, bottom_mm, left_mm, right_mm, page_style),
         }
 
         # ---- Open / Recent ---------------------------------------------
@@ -666,21 +1001,23 @@ class LibreOfficeMCPServer:
             "handler": lambda **kw: self.uno_bridge.clone_document(**kw),
         }
 
-        self.tools["export_active_document"] = {
-            "description": "Export the currently active (in-memory) document via storeToURL. WARNING: on macOS this may hang on the AppKit UI thread when the document is visible — prefer clone_document for file-on-disk conversion. This tool is intended for hidden / headless workflows.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "target_path": {"type": "string"},
-                    "target_format": {"type": "string"},
-                },
-                "required": ["target_path"],
-            },
-            "handler": lambda **kw: self.uno_bridge.export_active_document(**kw),
-        }
+        # export_active_document REMOVED — storeToURL on a visible component blocks
+        # the HTTP worker thread on macOS (AppKit UI-thread deadlock) and wedges the
+        # entire server until LibreOffice is restarted. Use clone_document for
+        # file-on-disk conversion (hidden component, no UI-thread contact).
 
         self.tools["execute_batch"] = {
-            "description": "Run a list of tool invocations sequentially in a single HTTP round-trip. Each operation is {tool: <name>, args: {...}}. Returns a parallel list of results in the same order. Use this to avoid per-step round-trip + token cost when an agent must do many writes (e.g. inserting hundreds of paragraphs with formatting). Set stop_on_error=true to short-circuit on the first failure (default false — collects all results).",
+            "description": (
+                "Run a list of tool invocations sequentially in a single HTTP "
+                "round-trip. Each operation is {tool: <name>, args: {...}}. "
+                "Returns a parallel list of results in the same order. "
+                "By default wraps the whole batch in lockControllers / "
+                "unlockControllers so that view updates are deferred to the end "
+                "— this is REQUIRED on macOS for any batch >~30 write ops on a "
+                "visible doc, otherwise SolarMutex contention with the AppKit "
+                "main thread can deadlock LibreOffice. Set lock_view=false only "
+                "if you want intermediate states visible (e.g. progress demo)."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -696,43 +1033,72 @@ class LibreOfficeMCPServer:
                         },
                     },
                     "stop_on_error": {"type": "boolean", "default": False},
+                    "lock_view": {"type": "boolean", "default": True,
+                                  "description": "Freeze view updates during the batch (recommended)."},
                 },
                 "required": ["operations"],
             },
-            "handler": lambda operations, stop_on_error=False: self._execute_batch(operations, stop_on_error),
+            "handler": lambda operations, stop_on_error=False, lock_view=True:
+                self._execute_batch(operations, stop_on_error, lock_view),
+        }
+
+        self.tools["lock_view"] = {
+            "description": "Freeze view updates of the active doc (lockControllers). Pair with unlock_view. Manual escape hatch — execute_batch does this automatically.",
+            "parameters": {"type": "object", "properties": {}},
+            "handler": lambda: self.uno_bridge.lock_view(),
+        }
+
+        self.tools["unlock_view"] = {
+            "description": "Resume view updates of the active doc (unlockControllers).",
+            "parameters": {"type": "object", "properties": {}},
+            "handler": lambda: self.uno_bridge.unlock_view(),
         }
 
         logger.info(f"Registered {len(self.tools)} MCP tools")
 
-    def _execute_batch(self, operations, stop_on_error: bool = False):
+    def _execute_batch(self, operations, stop_on_error: bool = False, lock_view: bool = True):
         results = []
         ok = 0
-        for i, op in enumerate(operations):
-            tool_name = op.get("tool") if isinstance(op, dict) else None
-            if not tool_name:
-                results.append({"success": False, "error": "missing 'tool' field", "index": i})
-                if stop_on_error: break
-                continue
-            args = op.get("args") or {}
-            tool = self.tools.get(tool_name)
-            if tool is None:
-                results.append({"success": False, "error": f"unknown tool: {tool_name}", "index": i})
-                if stop_on_error: break
-                continue
-            if tool_name == "execute_batch":
-                results.append({"success": False, "error": "execute_batch cannot be nested", "index": i})
-                if stop_on_error: break
-                continue
+        locked = False
+        if lock_view:
             try:
-                r = tool["handler"](**args)
-            except Exception as e:
-                r = {"success": False, "error": f"{type(e).__name__}: {e}"}
-            results.append(r)
-            if isinstance(r, dict) and r.get("success", True):
-                ok += 1
-            elif stop_on_error:
-                break
-        return {"success": True, "results": results, "ran": len(results), "ok": ok}
+                lr = self.uno_bridge.lock_view()
+                locked = bool(lr.get("success"))
+            except Exception:
+                locked = False
+        try:
+            for i, op in enumerate(operations):
+                tool_name = op.get("tool") if isinstance(op, dict) else None
+                if not tool_name:
+                    results.append({"success": False, "error": "missing 'tool' field", "index": i})
+                    if stop_on_error: break
+                    continue
+                args = op.get("args") or {}
+                tool = self.tools.get(tool_name)
+                if tool is None:
+                    results.append({"success": False, "error": f"unknown tool: {tool_name}", "index": i})
+                    if stop_on_error: break
+                    continue
+                if tool_name == "execute_batch":
+                    results.append({"success": False, "error": "execute_batch cannot be nested", "index": i})
+                    if stop_on_error: break
+                    continue
+                try:
+                    r = tool["handler"](**args)
+                except Exception as e:
+                    r = {"success": False, "error": f"{type(e).__name__}: {e}"}
+                results.append(r)
+                if isinstance(r, dict) and r.get("success", True):
+                    ok += 1
+                elif stop_on_error:
+                    break
+        finally:
+            if locked:
+                try:
+                    self.uno_bridge.unlock_view()
+                except Exception:
+                    pass
+        return {"success": True, "results": results, "ran": len(results), "ok": ok, "view_locked": locked}
     
     async def execute_tool(self, tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -784,10 +1150,10 @@ class LibreOfficeMCPServer:
     
     # Tool handler methods
     
-    def create_document_live(self, doc_type: str = "writer") -> Dict[str, Any]:
-        """Create a new document in LibreOffice"""
+    def create_document_live(self, doc_type: str = "writer", visible: bool = True) -> Dict[str, Any]:
+        """Create a new document. visible=False → hidden window (use for batch writes)."""
         try:
-            doc = self.uno_bridge.create_document(doc_type)
+            doc = self.uno_bridge.create_document(doc_type, visible=visible)
             url = ""
             try:
                 if hasattr(doc, "getURL"):
@@ -803,8 +1169,8 @@ class LibreOfficeMCPServer:
         except Exception as e:
             return {"success": False, "error": str(e)}
     
-    def insert_text_live(self, text: str, position: Optional[int] = None) -> Dict[str, Any]:
-        """Insert text into the currently active document"""
+    def insert_text_live(self, text: str, position=None) -> Dict[str, Any]:
+        """Insert text into the currently active document. position: 'end'|'cursor'|int."""
         return self.uno_bridge.insert_text(text, position)
     
     def get_document_info_live(self) -> Dict[str, Any]:
@@ -816,8 +1182,10 @@ class LibreOfficeMCPServer:
             return {"success": True, "document_info": doc_info}
     
     def format_text_live(self, **formatting) -> Dict[str, Any]:
-        """Apply formatting to selected text"""
-        return self.uno_bridge.format_text(formatting)
+        """Apply formatting. start/end (if given) → explicit char range, else current selection."""
+        start = formatting.pop("start", None)
+        end = formatting.pop("end", None)
+        return self.uno_bridge.format_text(formatting, start=start, end=end)
     
     def get_text_content_live(self) -> Dict[str, Any]:
         """Get text content of the currently active document"""
