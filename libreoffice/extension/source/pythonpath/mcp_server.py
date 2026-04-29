@@ -652,7 +652,87 @@ class LibreOfficeMCPServer:
             "handler": lambda: self.uno_bridge.get_tables_info(),
         }
 
+        self.tools["clone_document"] = {
+            "description": "Convert a file on disk from one format to another via a transient hidden LibreOffice component. Bypasses the macOS UI-thread save deadlock — does NOT touch any currently-open document. target_format is auto-derived from target_path extension if omitted. Supports docx, doc, odt, rtf, txt, html, xhtml, pdf, epub, xlsx, xls, ods, csv, pptx, ppt, odp.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_path": {"type": "string", "description": "Absolute path of the source file"},
+                    "target_path": {"type": "string", "description": "Absolute path of the target file (overwrites)"},
+                    "target_format": {"type": "string", "description": "Optional explicit format key (docx/odt/pdf/...). Defaults to target_path extension."},
+                },
+                "required": ["source_path", "target_path"],
+            },
+            "handler": lambda **kw: self.uno_bridge.clone_document(**kw),
+        }
+
+        self.tools["export_active_document"] = {
+            "description": "Export the currently active (in-memory) document via storeToURL. WARNING: on macOS this may hang on the AppKit UI thread when the document is visible — prefer clone_document for file-on-disk conversion. This tool is intended for hidden / headless workflows.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_path": {"type": "string"},
+                    "target_format": {"type": "string"},
+                },
+                "required": ["target_path"],
+            },
+            "handler": lambda **kw: self.uno_bridge.export_active_document(**kw),
+        }
+
+        self.tools["execute_batch"] = {
+            "description": "Run a list of tool invocations sequentially in a single HTTP round-trip. Each operation is {tool: <name>, args: {...}}. Returns a parallel list of results in the same order. Use this to avoid per-step round-trip + token cost when an agent must do many writes (e.g. inserting hundreds of paragraphs with formatting). Set stop_on_error=true to short-circuit on the first failure (default false — collects all results).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "operations": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": {"type": "string"},
+                                "args": {"type": "object"},
+                            },
+                            "required": ["tool"],
+                        },
+                    },
+                    "stop_on_error": {"type": "boolean", "default": False},
+                },
+                "required": ["operations"],
+            },
+            "handler": lambda operations, stop_on_error=False: self._execute_batch(operations, stop_on_error),
+        }
+
         logger.info(f"Registered {len(self.tools)} MCP tools")
+
+    def _execute_batch(self, operations, stop_on_error: bool = False):
+        results = []
+        ok = 0
+        for i, op in enumerate(operations):
+            tool_name = op.get("tool") if isinstance(op, dict) else None
+            if not tool_name:
+                results.append({"success": False, "error": "missing 'tool' field", "index": i})
+                if stop_on_error: break
+                continue
+            args = op.get("args") or {}
+            tool = self.tools.get(tool_name)
+            if tool is None:
+                results.append({"success": False, "error": f"unknown tool: {tool_name}", "index": i})
+                if stop_on_error: break
+                continue
+            if tool_name == "execute_batch":
+                results.append({"success": False, "error": "execute_batch cannot be nested", "index": i})
+                if stop_on_error: break
+                continue
+            try:
+                r = tool["handler"](**args)
+            except Exception as e:
+                r = {"success": False, "error": f"{type(e).__name__}: {e}"}
+            results.append(r)
+            if isinstance(r, dict) and r.get("success", True):
+                ok += 1
+            elif stop_on_error:
+                break
+        return {"success": True, "results": results, "ran": len(results), "ok": ok}
     
     async def execute_tool(self, tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -708,11 +788,17 @@ class LibreOfficeMCPServer:
         """Create a new document in LibreOffice"""
         try:
             doc = self.uno_bridge.create_document(doc_type)
+            url = ""
+            try:
+                if hasattr(doc, "getURL"):
+                    url = doc.getURL() or ""
+            except Exception:
+                url = ""
             return {
                 "success": True,
                 "message": f"Created new {doc_type} document",
                 "document_type": doc_type,
-                "url": doc.getURL() if hasattr(doc, "getURL") else "",
+                "url": url,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}

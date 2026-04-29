@@ -108,7 +108,7 @@ winget install astral-sh.uv
 
 Скрипт идемпотентен — можно перезапускать.
 
-## Доступные MCP-инструменты (57)
+## Доступные MCP-инструменты (60)
 
 | Категория | Tools |
 |---|---|
@@ -128,6 +128,9 @@ winget install astral-sh.uv
 | Секции | `list_sections` |
 | Метаданные | `set_document_metadata` |
 | Undo / Redo | `undo`, `redo`, `get_undo_history` |
+| Конвертация форматов | `clone_document` (file-on-disk, headless: ODT/DOCX/PDF/HTML/RTF/XLSX/...) |
+| Экспорт активного | `export_active_document` (storeToURL, осторожно на macOS) |
+| Батчинг | `execute_batch` (массив операций → один HTTP-вызов / один tool-call для агента) |
 | Низкоуровневое | `dispatch_uno_command` (whitelist из ~66 безопасных команд) |
 
 ## Известные ограничения (macOS)

@@ -27,6 +27,7 @@ class UNOBridge:
             self.smgr = self.ctx.ServiceManager
             self.desktop = self.smgr.createInstanceWithContext(
                 "com.sun.star.frame.Desktop", self.ctx)
+            self._last_active_doc = None
             logger.info("UNO Bridge initialized successfully")
         except Exception as e:
             logger.error(f"Failed to initialize UNO Bridge: {e}")
@@ -66,8 +67,17 @@ class UNOBridge:
                         win = frame.getContainerWindow()
                         if win is not None:
                             win.setVisible(True)
+                        # NOTE: do NOT call frame.activate() / setActiveFrame()
+                        # here — both block on AppKit UI thread on macOS when
+                        # invoked from a background HTTP-server thread. Routing
+                        # writes to the right doc is handled by the
+                        # `_last_active_doc` cache in get_active_document().
             except Exception as e:
                 logger.warning(f"Created document but could not show window: {e}")
+            # Remember the most recently created/opened doc as a fallback
+            # anchor for get_active_document — survives cases where
+            # setActiveFrame doesn't take effect immediately.
+            self._last_active_doc = doc
             logger.info(f"Created new {doc_type} document")
             return doc
             
@@ -82,6 +92,18 @@ class UNOBridge:
         returns nothing useful (happens after creating a doc with Hidden=True
         and re-showing it — its frame is not the active one yet).
         """
+        # Prefer the most recently created/opened document if it's still alive
+        # — this beats both getCurrentComponent (returns Start Center after
+        # Hidden=True load) and frame-scan (returns the wrong writer).
+        try:
+            cached = self._last_active_doc
+            if cached is not None and hasattr(cached, "supportsService"):
+                # Liveness probe — disposed components throw on any call.
+                _ = cached.getURL() if hasattr(cached, "getURL") else None
+                return cached
+        except Exception:
+            self._last_active_doc = None  # disposed — drop it
+
         # First try the truly-active document via getCurrentComponent — but
         # only accept it if it's a real document (not the Start Center).
         try:
@@ -910,6 +932,7 @@ class UNOBridge:
                             win.setVisible(True)
             except Exception as e:
                 logger.warning(f"Opened document but could not show window: {e}")
+            self._last_active_doc = doc
             return {
                 "success": True,
                 "url": doc.getURL() if hasattr(doc, "getURL") else url,
@@ -1714,6 +1737,92 @@ class UNOBridge:
             return {"success": False, "error": str(e)}
 
     # ---------------------------------------------------------------------
+
+    # Filter names for storeToURL — see https://help.libreoffice.org/latest/en-US/text/shared/guide/convertfilters.html
+    _STORE_FILTERS = {
+        "docx": "MS Word 2007 XML",
+        "doc":  "MS Word 97",
+        "odt":  "writer8",
+        "ott":  "writer8_template",
+        "rtf":  "Rich Text Format",
+        "txt":  "Text",
+        "html": "HTML (StarWriter)",
+        "xhtml": "XHTML Writer File",
+        "pdf":  "writer_pdf_Export",
+        "epub": "EPUB",
+        "xlsx": "Calc MS Excel 2007 XML",
+        "xls":  "MS Excel 97",
+        "ods":  "calc8",
+        "csv":  "Text - txt - csv (StarCalc)",
+        "pptx": "Impress MS PowerPoint 2007 XML",
+        "ppt":  "MS PowerPoint 97",
+        "odp":  "impress8",
+    }
+
+    def clone_document(self, source_path: str, target_path: str,
+                       target_format: str = None) -> Dict[str, Any]:
+        """Convert a file from one format to another via a hidden, transient
+        LibreOffice component — bypasses the macOS UI-thread save deadlock
+        because the component is never visible and never bound to the main
+        AppKit run loop.
+
+        target_format defaults to the target_path extension (e.g. .docx → docx).
+        Returns target URL on success.
+        """
+        try:
+            src_url = self._path_to_url(source_path)
+            dst_url = self._path_to_url(target_path)
+            ext = (target_format or "").lower().lstrip(".")
+            if not ext:
+                ext = target_path.rsplit(".", 1)[-1].lower() if "." in target_path else ""
+            filter_name = self._STORE_FILTERS.get(ext)
+            if not filter_name:
+                return {"success": False, "error": f"unknown target format '{ext}'. Supported: {sorted(self._STORE_FILTERS.keys())}"}
+
+            # Load source hidden — never attached to a visible frame
+            hidden = PropertyValue(); hidden.Name = "Hidden"; hidden.Value = True
+            macros = PropertyValue(); macros.Name = "MacroExecutionMode"; macros.Value = 0
+            doc = self.desktop.loadComponentFromURL(src_url, "_blank", 0, (hidden, macros))
+            if doc is None:
+                return {"success": False, "error": f"loadComponentFromURL returned None for {src_url}"}
+            try:
+                f = PropertyValue(); f.Name = "FilterName"; f.Value = filter_name
+                ow = PropertyValue(); ow.Name = "Overwrite"; ow.Value = True
+                doc.storeToURL(dst_url, (f, ow))
+            finally:
+                try:
+                    doc.close(True)
+                except Exception:
+                    try:
+                        doc.dispose()
+                    except Exception:
+                        pass
+            return {"success": True, "source": src_url, "target": dst_url, "filter": filter_name}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def export_active_document(self, target_path: str, target_format: str = None) -> Dict[str, Any]:
+        """Export the currently active document to a new file via storeToURL.
+        Same UI-thread caveat as save_document — kept here as a building block;
+        on macOS prefer clone_document(source_on_disk → target).
+        """
+        doc = self.get_active_document()
+        if doc is None:
+            return {"success": False, "error": "no active document"}
+        try:
+            dst_url = self._path_to_url(target_path)
+            ext = (target_format or "").lower().lstrip(".")
+            if not ext:
+                ext = target_path.rsplit(".", 1)[-1].lower() if "." in target_path else ""
+            filter_name = self._STORE_FILTERS.get(ext)
+            if not filter_name:
+                return {"success": False, "error": f"unknown target format '{ext}'"}
+            f = PropertyValue(); f.Name = "FilterName"; f.Value = filter_name
+            ow = PropertyValue(); ow.Name = "Overwrite"; ow.Value = True
+            doc.storeToURL(dst_url, (f, ow))
+            return {"success": True, "target": dst_url, "filter": filter_name}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
     def select_range(self, start: int, end: int) -> Dict[str, Any]:
         doc, err = self._require_writer()
