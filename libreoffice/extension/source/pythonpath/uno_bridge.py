@@ -268,7 +268,20 @@ class UNOBridge:
             
             if "font_name" in formatting:
                 text_range.CharFontName = formatting["font_name"]
-            
+
+            # Per-character kerning (extra horizontal spacing in 1/100 mm).
+            # Word imports often store small kerning on space characters between
+            # bold names — without this, justify-wrap differs.
+            # Wrap in try/except: setting CharKerning on certain ranges has been
+            # seen to deadlock under view_locked batches (LO tries to relayout).
+            if "kerning" in formatting and formatting["kerning"] is not None:
+                try: text_range.CharKerning = int(formatting["kerning"])
+                except Exception as kex: logger.warning(f"CharKerning set failed: {kex}")
+
+            if "scale_width" in formatting and formatting["scale_width"] is not None:
+                try: text_range.CharScaleWidth = int(formatting["scale_width"])
+                except Exception as sex: logger.warning(f"CharScaleWidth set failed: {sex}")
+
             logger.info("Applied formatting to selected text")
             return {"success": True, "message": "Formatting applied successfully"}
             
@@ -419,20 +432,39 @@ class UNOBridge:
 
     @staticmethod
     def _encode_tab_stops(stops):
-        align_rev = {0: "left", 1: "center", 2: "right", 3: "decimal"}
+        # TabAlign enum: LEFT=0, CENTER=1, RIGHT=2, DECIMAL=3, DEFAULT=4
+        align_name_map = {"LEFT": "left", "CENTER": "center", "RIGHT": "right",
+                          "DECIMAL": "decimal", "DEFAULT": "default"}
+        align_int_map = {0: "left", 1: "center", 2: "right", 3: "decimal", 4: "default"}
         out = []
         if not stops:
             return out
         for t in stops:
+            entry = {}
             try:
-                out.append({
-                    "position_mm": t.Position / 100.0,
-                    "alignment": align_rev.get(t.Alignment, "left"),
-                    "fill_char": chr(t.FillChar) if t.FillChar else " ",
-                    "decimal_char": chr(t.DecimalChar) if t.DecimalChar else ".",
-                })
+                entry["position_mm"] = t.Position / 100.0
             except Exception:
-                continue
+                continue  # no position → skip
+            # alignment can be enum (newer LO) or int (older) — try both
+            try:
+                a = t.Alignment
+                a_name = getattr(a, "value", None)
+                if isinstance(a_name, str):
+                    entry["alignment"] = align_name_map.get(a_name, a_name.lower())
+                else:
+                    try: entry["alignment"] = align_int_map.get(int(a), "left")
+                    except Exception: entry["alignment"] = "left"
+            except Exception:
+                entry["alignment"] = "left"
+            try:
+                entry["fill_char"] = chr(t.FillChar) if t.FillChar else " "
+            except Exception:
+                entry["fill_char"] = " "
+            try:
+                entry["decimal_char"] = chr(t.DecimalChar) if t.DecimalChar else "."
+            except Exception:
+                entry["decimal_char"] = "."
+            out.append(entry)
         return out
 
     def _selected_range_or_view_cursor(self, doc):
@@ -500,19 +532,30 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def set_paragraph_alignment(self, alignment: str, start=None, end=None) -> Dict[str, Any]:
+    def set_paragraph_alignment(self, alignment, start=None, end=None) -> Dict[str, Any]:
+        """alignment: string ('left'|'center'|'right'|'justify'|'block'|'stretch') or
+        raw int matching com.sun.star.style.ParagraphAdjust enum:
+        LEFT=0, RIGHT=1, BLOCK=2, CENTER=3, STRETCH=4, BLOCK_LINE=5.
+        Word imports use STRETCH (4) or BLOCK_LINE (5) for headings/dates that
+        appear "centered" via stretched whitespace — preserve via raw int."""
         doc, err = self._require_writer()
         if err:
             return err
-        # com.sun.star.style.ParagraphAdjust: LEFT=0, RIGHT=1, BLOCK=2, CENTER=3
-        mapping = {"left": 0, "right": 1, "justify": 2, "block": 2, "center": 3}
-        val = mapping.get(alignment.lower())
-        if val is None:
-            return {"success": False, "error": "Unknown alignment, use: left|center|right|justify"}
+        mapping = {"left": 0, "right": 1, "justify": 2, "block": 2, "center": 3,
+                   "stretch": 4, "block_line": 5}
+        if isinstance(alignment, int):
+            val = alignment
+        elif isinstance(alignment, str) and alignment.isdigit():
+            val = int(alignment)
+        else:
+            val = mapping.get(str(alignment).lower())
+        if val is None or not (0 <= val <= 5):
+            return {"success": False,
+                    "error": "Unknown alignment, use: left|center|right|justify|stretch|block_line or int 0-5"}
         try:
             rng = self._resolve_range(doc, start, end)
             rng.ParaAdjust = val
-            return {"success": True, "alignment": alignment}
+            return {"success": True, "alignment": val}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -558,6 +601,102 @@ class UNOBridge:
             if context_margin is not None:
                 rng.ParaContextMargin = bool(context_margin)
                 applied["context_margin"] = bool(context_margin)
+            return {"success": True, "applied": applied}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    _BREAK_NAMES = ["NONE", "COLUMN_BEFORE", "COLUMN_AFTER", "COLUMN_BOTH",
+                    "PAGE_BEFORE", "PAGE_AFTER", "PAGE_BOTH"]
+
+    def set_paragraph_breaks(self, break_type=None, page_desc_name=None,
+                             page_number_offset=None,
+                             start=None, end=None) -> Dict[str, Any]:
+        """Set BreakType / PageDescName / PageNumberOffset on paragraphs in [start, end).
+
+        break_type: int 0..6 or string name from com.sun.star.style.BreakType
+            (NONE=0, COLUMN_BEFORE=1, COLUMN_AFTER=2, COLUMN_BOTH=3,
+             PAGE_BEFORE=4, PAGE_AFTER=5, PAGE_BOTH=6). PAGE_BEFORE forces
+            a page break before the paragraph — needed to replicate the
+            visual page layout of Word-imported documents.
+        page_desc_name: name of a page-style assigned via PageDescName.
+            Only effective on paragraphs that also carry a PAGE_* break.
+        page_number_offset: int — restart numbering at this value at the
+            page introduced by the break.
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            rng = self._resolve_range(doc, start, end)
+            applied = {}
+            if break_type is not None:
+                if isinstance(break_type, str) and not break_type.lstrip("-").isdigit():
+                    bt_name = break_type.upper()
+                    if bt_name not in self._BREAK_NAMES:
+                        return {"success": False, "error": f"unknown break_type {break_type!r}"}
+                else:
+                    bt_int = int(break_type)
+                    if not 0 <= bt_int <= 6:
+                        return {"success": False, "error": "break_type must be 0..6"}
+                    bt_name = self._BREAK_NAMES[bt_int]
+                rng.BreakType = uno.Enum("com.sun.star.style.BreakType", bt_name)
+                applied["break_type"] = bt_name
+            if page_desc_name is not None:
+                rng.PageDescName = str(page_desc_name) if page_desc_name else ""
+                applied["page_desc_name"] = page_desc_name
+            if page_number_offset is not None:
+                rng.PageNumberOffset = int(page_number_offset)
+                applied["page_number_offset"] = int(page_number_offset)
+            return {"success": True, "applied": applied}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def set_paragraph_text_flow(self, widows=None, orphans=None,
+                                keep_together=None, split_paragraph=None,
+                                keep_with_next=None,
+                                start=None, end=None) -> Dict[str, Any]:
+        """Set text-flow properties on paragraphs in [start, end). These
+        govern HOW the paragraph breaks across pages — the difference between
+        "last word falls onto a near-empty next page" and "all 5 lines stay
+        together". Word→ODT often sets these per paragraph; without
+        replicating, target page-layout drifts from source.
+
+        widows / orphans: int — minimum number of lines to keep on the
+            new / old page when paragraph breaks across them.
+        keep_together: bool — paragraph never splits across pages.
+        split_paragraph: bool — paragraph IS allowed to split (False = same
+            as keep_together but exposed as separate UNO field).
+        keep_with_next: bool — paragraph stays glued to the next one
+            (no break between them).
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            rng = self._resolve_range(doc, start, end)
+            applied = {}
+            if widows is not None:
+                rng.ParaWidows = int(widows)
+                applied["widows"] = int(widows)
+            if orphans is not None:
+                rng.ParaOrphans = int(orphans)
+                applied["orphans"] = int(orphans)
+            if keep_together is not None:
+                rng.ParaKeepTogether = bool(keep_together)
+                applied["keep_together"] = bool(keep_together)
+            if split_paragraph is not None:
+                rng.ParaSplit = bool(split_paragraph)
+                applied["split_paragraph"] = bool(split_paragraph)
+            if keep_with_next is not None:
+                # ParaKeepWithNext is the modern name; older builds expose
+                # KeepWithNext directly. Try both.
+                for prop in ("ParaKeepWithNext", "KeepWithNext"):
+                    try:
+                        setattr(rng, prop, bool(keep_with_next))
+                        break
+                    except Exception:
+                        continue
+                applied["keep_with_next"] = bool(keep_with_next)
             return {"success": True, "applied": applied}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -736,6 +875,344 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def list_text_frames(self, source_path: str = None, doc_title: str = None) -> Dict[str, Any]:
+        """List all TextFrames (free-floating boxes) in a doc with their text,
+        size, position, anchor type. PageNumber fields visible at page bottoms
+        are often inside TextFrames anchored to body paragraphs, NOT in the
+        page-style's footer slot."""
+        try:
+            doc = None
+            if source_path:
+                doc = self._find_open_doc(source_path)
+            if doc is None and doc_title:
+                comps = self.desktop.getComponents()
+                it = comps.createEnumeration()
+                while it.hasMoreElements():
+                    c = it.nextElement()
+                    try: t = c.getTitle()
+                    except Exception: t = ""
+                    if t == doc_title:
+                        doc = c; break
+            if doc is None:
+                doc, err = self._require_writer()
+                if err: return err
+            frames = []
+            try:
+                tf = doc.getTextFrames()
+                for i in range(tf.Count):
+                    f = tf.getByIndex(i)
+                    entry = {"name": getattr(f, "Name", "")}
+                    try: entry["text"] = (f.getString() or "")[:100]
+                    except Exception: pass
+                    try:
+                        sz = f.Size
+                        entry["size_mm"] = {"w": sz.Width/100.0, "h": sz.Height/100.0}
+                    except Exception: pass
+                    try:
+                        pos = f.Position
+                        entry["pos_mm"] = {"x": pos.X/100.0, "y": pos.Y/100.0}
+                    except Exception: pass
+                    try:
+                        a = f.AnchorType
+                        entry["anchor_type"] = getattr(a, "value", str(a))
+                    except Exception: pass
+                    try:
+                        anchor = f.Anchor
+                        if anchor is not None:
+                            entry["anchor_text"] = (anchor.getString() or "")[:60]
+                    except Exception: pass
+                    # Find anchor paragraph index. anchor.getString() is empty
+                    # for all 11 page-number frames so string equality fails.
+                    # compareRegionStarts and gotoPreviousParagraph also fail
+                    # because frame.Anchor lives in a different Text container.
+                    # Last resort: pyuno proxy identity — if frame.Anchor IS
+                    # one of the body paragraphs (XTextContent), `==` between
+                    # them will be True for the same wrapped UNO object.
+                    try:
+                        anchor = f.Anchor
+                        if anchor is not None:
+                            body = doc.getText()
+                            pe = body.createEnumeration()
+                            idx = 0
+                            matched = None
+                            while pe.hasMoreElements():
+                                p = pe.nextElement()
+                                if p.supportsService("com.sun.star.text.Paragraph"):
+                                    try:
+                                        if p == anchor:
+                                            matched = idx
+                                            break
+                                    except Exception: pass
+                                    idx += 1
+                            if matched is not None:
+                                entry["anchor_para_index"] = matched
+                            else:
+                                entry["anchor_para_error"] = "anchor != any body paragraph"
+                    except Exception as e:
+                        entry["anchor_para_error"] = str(e)
+                    # Vertical/horizontal positioning
+                    for prop in ("HoriOrient", "VertOrient", "HoriOrientPosition",
+                                 "VertOrientPosition", "HoriOrientRelation",
+                                 "VertOrientRelation", "RelativeWidth", "RelativeHeight"):
+                        try:
+                            v = f.getPropertyValue(prop)
+                            if hasattr(v, "value"): v = v.value
+                            if isinstance(v, (int, float, str, bool)):
+                                entry[prop] = v
+                        except Exception: pass
+                    # Border/transparency
+                    try: entry["BackTransparent"] = bool(f.BackTransparent)
+                    except Exception: pass
+                    try:
+                        info = f.getPropertySetInfo()
+                        for bp in ("LeftBorder", "RightBorder", "TopBorder", "BottomBorder"):
+                            if info.hasPropertyByName(bp):
+                                try:
+                                    bord = f.getPropertyValue(bp)
+                                    entry[bp + "_width"] = int(getattr(bord, "OuterLineWidth", 0) or 0)
+                                except Exception: pass
+                    except Exception: pass
+                    # walk inner portions to detect TextFields
+                    fields = []
+                    try:
+                        pe = f.createEnumeration()
+                        while pe.hasMoreElements():
+                            p = pe.nextElement()
+                            qe = p.createEnumeration()
+                            while qe.hasMoreElements():
+                                q = qe.nextElement()
+                                if getattr(q, "TextPortionType", "") == "TextField":
+                                    try:
+                                        fld = q.TextField
+                                        svc = next((s for s in (fld.SupportedServiceNames or [])
+                                                    if s.startswith("com.sun.star.text.TextField.")
+                                                    and s != "com.sun.star.text.TextField"), "?")
+                                        fields.append({"service": svc.split(".")[-1],
+                                                       "present": fld.getPresentation(False) if hasattr(fld, "getPresentation") else None})
+                                    except Exception: pass
+                    except Exception: pass
+                    if fields: entry["fields"] = fields
+                    frames.append(entry)
+            except Exception as ex:
+                return {"success": False, "error": str(ex)}
+            return {"success": True, "frames": frames, "count": len(frames)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def list_text_fields(self, source_path: str = None, doc_title: str = None) -> Dict[str, Any]:
+        """List all TextFields in a doc with their service name, presentation,
+        and anchor text/paragraph. Reveals PageNumber / Date / etc. fields
+        anywhere in the document (body, frames, headers, footers)."""
+        try:
+            doc = None
+            if source_path:
+                doc = self._find_open_doc(source_path)
+            if doc is None and doc_title:
+                comps = self.desktop.getComponents()
+                it = comps.createEnumeration()
+                while it.hasMoreElements():
+                    c = it.nextElement()
+                    try: t = c.getTitle()
+                    except Exception: t = ""
+                    if t == doc_title:
+                        doc = c; break
+            if doc is None:
+                doc, err = self._require_writer()
+                if err: return err
+            out = []
+            try:
+                e = doc.getTextFields().createEnumeration()
+                while e.hasMoreElements():
+                    f = e.nextElement()
+                    services = list(getattr(f, "SupportedServiceNames", []) or [])
+                    svc = next((s for s in services if s.startswith("com.sun.star.text.TextField.")
+                                and s != "com.sun.star.text.TextField"), services[0] if services else "?")
+                    entry = {"service": svc}
+                    try: entry["present"] = f.getPresentation(False)
+                    except Exception: pass
+                    # anchor text snippet
+                    try:
+                        a = f.getAnchor()
+                        if a is not None:
+                            try: entry["anchor_text"] = (a.getString() or "")[:60]
+                            except Exception: pass
+                    except Exception: pass
+                    out.append(entry)
+            except Exception as ex:
+                return {"success": False, "error": str(ex)}
+            return {"success": True, "fields": out, "count": len(out)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def dump_char_style(self, style_name: str, source_path: str = None,
+                        doc_title: str = None) -> Dict[str, Any]:
+        """Read a character style's font/size/weight/posture/etc. from any open
+        doc. Compares cloned char styles between source and target."""
+        try:
+            doc = None
+            if source_path:
+                doc = self._find_open_doc(source_path)
+            if doc is None and doc_title:
+                comps = self.desktop.getComponents()
+                it = comps.createEnumeration()
+                while it.hasMoreElements():
+                    c = it.nextElement()
+                    try: t = c.getTitle()
+                    except Exception: t = ""
+                    if t == doc_title:
+                        doc = c; break
+            if doc is None:
+                doc, err = self._require_writer()
+                if err: return err
+            fam = doc.getStyleFamilies().getByName("CharacterStyles")
+            if not fam.hasByName(style_name):
+                return {"success": False, "error": f"char style {style_name!r} not found"}
+            st = fam.getByName(style_name)
+            out = {}
+            for prop in ("CharFontName", "CharHeight", "CharWeight",
+                         "CharPosture", "CharColor", "CharUnderline",
+                         "CharStrikeout", "CharKerning", "CharScaleWidth",
+                         "CharBackColor", "ParentStyle", "DisplayName"):
+                try:
+                    v = st.getPropertyValue(prop)
+                    if hasattr(v, "value"):
+                        v = v.value
+                    if isinstance(v, (bool, int, float, str)):
+                        out[prop] = v
+                    else:
+                        out[prop] = str(v)
+                except Exception: pass
+            return {"success": True, "style": style_name, "props": out,
+                    "doc_title": doc.getTitle() if hasattr(doc, "getTitle") else None}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def dump_doc_paragraph(self, source_path: str = None, doc_title: str = None,
+                           paragraph_index: int = 0) -> Dict[str, Any]:
+        """Return paragraph + rule level props as JSON-safe primitives. No
+        struct walking — pure int/float/str only. Picks doc by source_path
+        (file URL match) or doc_title (e.g. 'Untitled 1'). Falls back to active."""
+        try:
+            doc = None
+            if source_path:
+                doc = self._find_open_doc(source_path)
+            if doc is None and doc_title:
+                comps = self.desktop.getComponents()
+                it = comps.createEnumeration()
+                while it.hasMoreElements():
+                    c = it.nextElement()
+                    try: t = c.getTitle()
+                    except Exception: t = ""
+                    if t == doc_title:
+                        doc = c; break
+            if doc is None:
+                doc, err = self._require_writer()
+                if err: return err
+
+            text = doc.getText()
+            pe = text.createEnumeration()
+            i = 0; target = None
+            while pe.hasMoreElements():
+                p = pe.nextElement()
+                if not p.supportsService("com.sun.star.text.Paragraph"):
+                    continue
+                if i == paragraph_index:
+                    target = p; break
+                i += 1
+            if target is None:
+                return {"success": False, "error": f"paragraph {paragraph_index} not found"}
+
+            def _i(x):
+                try: return int(x)
+                except Exception:
+                    try: return int(getattr(x, "value", 0))
+                    except Exception: return None
+            def _s(x):
+                try: return str(x) if x is not None else None
+                except Exception: return None
+
+            out = {
+                "index": paragraph_index,
+                "text": (target.getString() or "")[:120],
+                "ParaStyleName": _s(target.ParaStyleName),
+                "ParaAdjust": _i(target.ParaAdjust),
+                "ParaLeftMargin": _i(target.ParaLeftMargin),
+                "ParaRightMargin": _i(target.ParaRightMargin),
+                "ParaFirstLineIndent": _i(target.ParaFirstLineIndent),
+                "ParaTopMargin": _i(getattr(target, "ParaTopMargin", 0)),
+                "ParaBottomMargin": _i(getattr(target, "ParaBottomMargin", 0)),
+                "NumberingLevel": _i(getattr(target, "NumberingLevel", 0)),
+                "NumberingIsNumber": bool(getattr(target, "NumberingIsNumber", False)),
+                "ListLabelString": _s(getattr(target, "ListLabelString", "")),
+            }
+            try:
+                ls = target.ParaLineSpacing
+                out["ParaLineSpacing"] = {"mode": _i(ls.Mode), "height": _i(ls.Height)}
+            except Exception: pass
+            try:
+                tabs = []
+                for ts in (target.ParaTabStops or []):
+                    try:
+                        tabs.append({"position": _i(ts.Position),
+                                     "alignment": _i(getattr(ts, "Alignment", 0))})
+                    except Exception: pass
+                out["ParaTabStops"] = tabs
+            except Exception: pass
+            # runs with full char props
+            try:
+                runs = []
+                qe = target.createEnumeration()
+                while qe.hasMoreElements():
+                    q = qe.nextElement()
+                    ptype = getattr(q, "TextPortionType", "?")
+                    s = q.getString() or ""
+                    if not s and ptype == "Text": continue
+                    r = {"type": ptype, "text": s[:80]}
+                    for cp in ("CharFontName", "CharHeight", "CharWeight",
+                               "CharPosture", "CharUnderline", "CharStyleName",
+                               "CharKerning", "CharScaleWidth", "CharWordMode",
+                               "CharLocale", "CharFontNameAsian", "CharHeightAsian",
+                               "CharWeightAsian", "CharFontNameComplex", "CharHeightComplex",
+                               "CharWeightComplex", "CharNoHyphenation"):
+                        try:
+                            v = q.getPropertyValue(cp)
+                            if hasattr(v, "value"):
+                                v = v.value
+                            if isinstance(v, (bool, int, float, str)):
+                                r[cp] = v
+                            else:
+                                r[cp] = str(v)
+                        except Exception: pass
+                    runs.append(r)
+                out["runs"] = runs
+            except Exception: pass
+            try:
+                rules = target.getPropertyValue("NumberingRules")
+                if rules is not None:
+                    out["NumberingRules_Name"] = _s(getattr(rules, "Name", None))
+                    lvl = _i(target.NumberingLevel) or 0
+                    try:
+                        props = rules.getByIndex(lvl)
+                        rule_lvl = {}
+                        for pv in props:
+                            try:
+                                v = pv.Value
+                                if isinstance(v, (bool, int, float, str)):
+                                    rule_lvl[pv.Name] = v
+                                elif hasattr(v, "value") and isinstance(v.value, (bool, int, float, str)):
+                                    rule_lvl[pv.Name] = v.value
+                                else:
+                                    rule_lvl[pv.Name] = type(v).__name__
+                            except Exception: pass
+                        out["rule_level_props"] = rule_lvl
+                    except Exception as ex:
+                        out["rule_level_err"] = str(ex)
+            except Exception: pass
+            return {"success": True, "paragraph": out,
+                    "doc_title": _s(doc.getTitle() if hasattr(doc, "getTitle") else None)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def clone_numbering_rule(self, source_path: str, rule_name: str,
                              target_name: str = None) -> Dict[str, Any]:
         """Copy a NumberingStyle from a currently-open source doc into the active doc.
@@ -798,9 +1275,60 @@ class UNOBridge:
                 tgt_fam.insertByName(tgt_name, tgt_style)
                 created = True
 
-            tgt_style.NumberingRules = src_fam.getByName(rule_name).NumberingRules
+            src_rules_obj = src_fam.getByName(rule_name).NumberingRules
+            tgt_style.NumberingRules = src_rules_obj
+
+            # Auto-clone any character styles referenced by level CharStyleName.
+            # Without this, target gets a stub char style with default font (e.g.
+            # Liberation Serif 12pt) instead of source's actual style (e.g. Calibri
+            # 11pt) — labels render with wrong width and tab-gap differs.
+            cloned_chars = []
+            try:
+                src_char_fam = src_doc.getStyleFamilies().getByName("CharacterStyles")
+                tgt_char_fam = doc.getStyleFamilies().getByName("CharacterStyles")
+                seen = set()
+                for lvl in range(src_rules_obj.Count):
+                    try:
+                        props = src_rules_obj.getByIndex(lvl)
+                    except Exception:
+                        continue
+                    char_name = ""
+                    for pv in props:
+                        if pv.Name == "CharStyleName":
+                            char_name = pv.Value or ""
+                            break
+                    if not char_name or char_name in seen:
+                        continue
+                    seen.add(char_name)
+                    if not src_char_fam.hasByName(char_name):
+                        continue
+                    src_cs = src_char_fam.getByName(char_name)
+                    if tgt_char_fam.hasByName(char_name):
+                        tgt_cs = tgt_char_fam.getByName(char_name)
+                    else:
+                        tgt_cs = doc.createInstance("com.sun.star.style.CharacterStyle")
+                        tgt_char_fam.insertByName(char_name, tgt_cs)
+                    # copy a focused set of char props
+                    for cprop in ("CharFontName", "CharHeight", "CharWeight",
+                                  "CharPosture", "CharColor", "CharUnderline",
+                                  "CharStrikeout", "CharKerning", "CharScaleWidth",
+                                  "CharBackColor", "CharFontNameAsian", "CharHeightAsian",
+                                  "CharWeightAsian", "CharPostureAsian",
+                                  "CharFontNameComplex", "CharHeightComplex",
+                                  "CharWeightComplex", "CharPostureComplex"):
+                        try:
+                            if not src_cs.getPropertySetInfo().hasPropertyByName(cprop): continue
+                            if not tgt_cs.getPropertySetInfo().hasPropertyByName(cprop): continue
+                            tgt_cs.setPropertyValue(cprop, src_cs.getPropertyValue(cprop))
+                        except Exception:
+                            pass
+                    cloned_chars.append(char_name)
+            except Exception as ex:
+                cloned_chars.append(f"<err: {ex}>")
+
             return {"success": True, "rule_name": tgt_name, "created": created,
-                    "source_rule": rule_name, "source_path": source_path}
+                    "source_rule": rule_name, "source_path": source_path,
+                    "cloned_char_styles": cloned_chars}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -897,6 +1425,13 @@ class UNOBridge:
                 "ParaTabStops",
                 "ParaOrphans", "ParaWidows", "ParaKeepTogether",
                 "ParaSplit",
+                # KeepWithNext on a paragraph style (e.g. Heading 1) glues
+                # heading to the following block (paragraph or table). Without
+                # cloning this prop, target's heading "release" the table
+                # below — both jump to the next page as one big chunk
+                # instead of staying together with body-text continuing
+                # naturally on the current page.
+                "ParaKeepWithNext", "KeepWithNext",
                 "ParaIsHyphenation", "ParaHyphenationMaxHyphens",
                 "ParaHyphenationMaxLeadingChars", "ParaHyphenationMaxTrailingChars",
                 "ParaRegisterModeActive",
@@ -942,6 +1477,151 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def _clone_xtext(self, doc, src_xtext, tgt_xtext) -> Dict[str, int]:
+        """Replace tgt_xtext content with src_xtext content, preserving paragraph
+        structure, character formatting, and TextFields (PageNumber, Date, etc.).
+
+        setString() loses fields — this walks portions and recreates each one.
+        """
+        # Clear target. setString("") is idempotent and cheap.
+        try:
+            tgt_xtext.setString("")
+        except Exception:
+            pass
+
+        cursor = tgt_xtext.createTextCursor()
+        # Char props worth carrying onto inserted text. Para props on portion=0
+        # captured when we set them on the cursor before each paragraph.
+        CHAR_PROPS = (
+            "CharFontName", "CharHeight", "CharWeight", "CharPosture",
+            "CharUnderline", "CharStrikeout", "CharColor", "CharBackColor",
+            "CharEscapement", "CharEscapementHeight",
+            "CharFontNameAsian", "CharHeightAsian", "CharWeightAsian", "CharPostureAsian",
+            "CharFontNameComplex", "CharHeightComplex", "CharWeightComplex",
+            "CharStyleName", "CharKerning", "CharWordMode",
+        )
+        PARA_PROPS = (
+            "ParaAdjust", "ParaStyleName",
+            "ParaLeftMargin", "ParaRightMargin", "ParaFirstLineIndent",
+            "ParaTopMargin", "ParaBottomMargin",
+            "ParaLineSpacing", "ParaTabStops",
+        )
+
+        def _copy_props(src_obj, dst_setter, names):
+            """Copy each prop one-by-one; skip on error so partial read works."""
+            try:
+                info = src_obj.getPropertySetInfo()
+            except Exception:
+                info = None
+            for n in names:
+                try:
+                    if info is not None and not info.hasPropertyByName(n):
+                        continue
+                    v = src_obj.getPropertyValue(n)
+                    dst_setter(n, v)
+                except Exception:
+                    pass
+
+        copied_text = 0
+        copied_fields = 0
+        first_para = True
+        try:
+            para_enum = src_xtext.createEnumeration()
+        except Exception as ex:
+            return {"copied_text": 0, "copied_fields": 0, "error": str(ex)}
+
+        while para_enum.hasMoreElements():
+            src_para = para_enum.nextElement()
+            if not first_para:
+                # PARAGRAPH_BREAK = 0
+                try:
+                    tgt_xtext.insertControlCharacter(cursor, 0, False)
+                except Exception:
+                    pass
+            first_para = False
+
+            # Apply paragraph-level props on the cursor before inserting text.
+            _copy_props(src_para, lambda n, v: cursor.setPropertyValue(n, v), PARA_PROPS)
+
+            try:
+                portion_enum = src_para.createEnumeration()
+            except Exception:
+                continue
+
+            while portion_enum.hasMoreElements():
+                portion = portion_enum.nextElement()
+                try:
+                    ptype = portion.TextPortionType
+                except Exception:
+                    ptype = "Text"
+
+                if ptype == "Text":
+                    txt = ""
+                    try:
+                        txt = portion.getString() or ""
+                    except Exception:
+                        txt = ""
+                    if not txt:
+                        continue
+                    _copy_props(portion, lambda n, v: cursor.setPropertyValue(n, v), CHAR_PROPS)
+                    try:
+                        tgt_xtext.insertString(cursor, txt, False)
+                        copied_text += len(txt)
+                    except Exception:
+                        pass
+                elif ptype == "TextField":
+                    try:
+                        src_fld = portion.TextField
+                    except Exception:
+                        src_fld = None
+                    if src_fld is None:
+                        try:
+                            tgt_xtext.insertString(cursor, portion.getString() or "", False)
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        services = list(src_fld.SupportedServiceNames or [])
+                    except Exception:
+                        services = []
+                    fld_service = None
+                    for s in services:
+                        if (s.startswith("com.sun.star.text.TextField.")
+                                and s != "com.sun.star.text.TextField"):
+                            fld_service = s
+                            break
+                    if not fld_service:
+                        try:
+                            tgt_xtext.insertString(cursor, portion.getString() or "", False)
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        new_fld = doc.createInstance(fld_service)
+                        # copy field-specific props (NumberingType, SubType, IsFixed, ...)
+                        try:
+                            for prop in src_fld.getPropertySetInfo().getProperties():
+                                try:
+                                    new_fld.setPropertyValue(
+                                        prop.Name,
+                                        src_fld.getPropertyValue(prop.Name))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        # apply char props at insertion point
+                        _copy_props(portion, lambda n, v: cursor.setPropertyValue(n, v), CHAR_PROPS)
+                        tgt_xtext.insertTextContent(cursor, new_fld, False)
+                        copied_fields += 1
+                    except Exception:
+                        try:
+                            tgt_xtext.insertString(cursor, portion.getString() or "", False)
+                        except Exception:
+                            pass
+                # other portion types (Bookmark/Footnote/Frame) — skip; rare in headers/footers
+
+        return {"copied_text": copied_text, "copied_fields": copied_fields}
+
     def clone_page_style(self, source_path: str,
                          source_style: str = None,
                          target_style: str = "Default Page Style") -> Dict[str, Any]:
@@ -979,14 +1659,22 @@ class UNOBridge:
             src = src_fam.getByName(source_style)
             tgt_fam = doc.getStyleFamilies().getByName("PageStyles")
             if not tgt_fam.hasByName(target_style):
-                # locale fallback for target too
-                for cand in ("Default Page Style", "Standard", "Default Style"):
-                    if tgt_fam.hasByName(cand):
-                        target_style = cand; break
-                if not tgt_fam.hasByName(target_style):
-                    return {"success": False,
-                            "error": f"target page style not found: {target_style!r}",
-                            "target_available": list(tgt_fam.getElementNames())}
+                # Word→ODT imports use per-section page-styles named MP0..MPN
+                # to encode different headers/footers across sections. When
+                # replicating such a doc we need MPx styles in target — create
+                # them on demand instead of falling back to Default.
+                try:
+                    new_style = doc.createInstance("com.sun.star.style.PageStyle")
+                    tgt_fam.insertByName(target_style, new_style)
+                except Exception as ce:
+                    # Locale fallback only if creation fails (older LO, etc.)
+                    for cand in ("Default Page Style", "Standard", "Default Style"):
+                        if tgt_fam.hasByName(cand):
+                            target_style = cand; break
+                    if not tgt_fam.hasByName(target_style):
+                        return {"success": False,
+                                "error": f"could not create or fallback target page style: {ce}",
+                                "target_available": list(tgt_fam.getElementNames())}
             tgt = tgt_fam.getByName(target_style)
 
             # Header / Footer have to be enabled BEFORE copying their text /
@@ -1040,17 +1728,18 @@ class UNOBridge:
                 except Exception as ex:
                     failed.append({"prop": name, "error": str(ex)})
 
-            # Header/Footer text bodies are XText objects — copy via setString
+            # Header/Footer text bodies are XText objects — clone full structure
+            # (paragraphs, char formatting, TextFields like PageNumber).
+            header_stats = None
+            footer_stats = None
             try:
                 if getattr(src, "HeaderIsOn", False) and getattr(tgt, "HeaderIsOn", False):
-                    h_txt = src.HeaderText.getString()
-                    tgt.HeaderText.setString(h_txt)
+                    header_stats = self._clone_xtext(doc, src.HeaderText, tgt.HeaderText)
             except Exception as ex:
                 failed.append({"prop": "HeaderText", "error": str(ex)})
             try:
                 if getattr(src, "FooterIsOn", False) and getattr(tgt, "FooterIsOn", False):
-                    f_txt = src.FooterText.getString()
-                    tgt.FooterText.setString(f_txt)
+                    footer_stats = self._clone_xtext(doc, src.FooterText, tgt.FooterText)
             except Exception as ex:
                 failed.append({"prop": "FooterText", "error": str(ex)})
 
@@ -1058,6 +1747,8 @@ class UNOBridge:
                     "target_style": target_style,
                     "header_enabled": bool(getattr(tgt, "HeaderIsOn", False)),
                     "footer_enabled": bool(getattr(tgt, "FooterIsOn", False)),
+                    "header_stats": header_stats,
+                    "footer_stats": footer_stats,
                     "copied_count": len(copied), "failed_count": len(failed),
                     "failed_props": failed[:5]}
         except Exception as e:
@@ -1146,7 +1837,16 @@ class UNOBridge:
                 if include_format:
                     try:
                         entry["style"] = para.ParaStyleName
-                        entry["alignment"] = ["left", "right", "justify", "center"][para.ParaAdjust] if para.ParaAdjust in (0,1,2,3) else str(para.ParaAdjust)
+                        # ParagraphAdjust: LEFT=0,RIGHT=1,BLOCK=2,CENTER=3,STRETCH=4,BLOCK_LINE=5
+                        # Expose raw int (paragraph_adjust) for fidelity + readable name (alignment).
+                        adj = para.ParaAdjust
+                        adj_int = int(getattr(adj, "value", adj)) if not isinstance(adj, int) else adj
+                        try: adj_int = int(adj)
+                        except Exception:
+                            try: adj_int = int(getattr(adj, "value", 0))
+                            except Exception: adj_int = 0
+                        entry["paragraph_adjust"] = adj_int
+                        entry["alignment"] = {0:"left",1:"right",2:"justify",3:"center",4:"stretch",5:"block_line"}.get(adj_int, str(adj_int))
                         entry["left_mm"] = para.ParaLeftMargin / 100.0
                         entry["right_mm"] = para.ParaRightMargin / 100.0
                         entry["first_line_mm"] = para.ParaFirstLineIndent / 100.0
@@ -1191,6 +1891,33 @@ class UNOBridge:
                             entry["numbering_rule_name"] = getattr(nr, "Name", "") if nr else ""
                         except Exception:
                             entry["numbering_rule_name"] = ""
+                        # Paragraph-level CharHeight (font size). Important
+                        # for EMPTY paragraphs: without runs, font size info
+                        # gets lost — but UNO surfaces it on the paragraph
+                        # itself, derived from style or override. Word→ODT
+                        # often emits 1pt/2pt empty paragraphs to compress
+                        # spacing; without replicating, target's 12pt empties
+                        # take a full line each.
+                        try: entry["char_height"] = float(getattr(para, "CharHeight", 0) or 0)
+                        except Exception: entry["char_height"] = None
+                        # Text-flow — Word→ODT часто кодирует "не разрывать
+                        # абзац" / "не отрывать от следующего" на per-paragraph
+                        # уровне. Без репликации последняя строка / слово
+                        # "проваливается" на следующую страницу, ломая layout.
+                        try: entry["widows"] = int(getattr(para, "ParaWidows", 0) or 0)
+                        except Exception: entry["widows"] = 0
+                        try: entry["orphans"] = int(getattr(para, "ParaOrphans", 0) or 0)
+                        except Exception: entry["orphans"] = 0
+                        try: entry["keep_together"] = bool(getattr(para, "ParaKeepTogether", False))
+                        except Exception: entry["keep_together"] = False
+                        try: entry["split_paragraph"] = bool(getattr(para, "ParaSplit", True))
+                        except Exception: entry["split_paragraph"] = True
+                        try:
+                            kwn = getattr(para, "ParaKeepWithNext", None)
+                            if kwn is None:
+                                kwn = getattr(para, "KeepWithNext", False)
+                            entry["keep_with_next"] = bool(kwn)
+                        except Exception: entry["keep_with_next"] = False
                     except Exception as fe:
                         entry["format_error"] = str(fe)
                 out.append(entry)
@@ -1294,7 +2021,16 @@ class UNOBridge:
                     try:
                         entry["style"] = para.ParaStyleName
                         entry["outline_level"] = int(getattr(para, "OutlineLevel", 0) or 0)
-                        entry["alignment"] = ["left", "right", "justify", "center"][para.ParaAdjust] if para.ParaAdjust in (0,1,2,3) else str(para.ParaAdjust)
+                        # ParagraphAdjust: LEFT=0,RIGHT=1,BLOCK=2,CENTER=3,STRETCH=4,BLOCK_LINE=5
+                        # Expose raw int (paragraph_adjust) for fidelity + readable name (alignment).
+                        adj = para.ParaAdjust
+                        adj_int = int(getattr(adj, "value", adj)) if not isinstance(adj, int) else adj
+                        try: adj_int = int(adj)
+                        except Exception:
+                            try: adj_int = int(getattr(adj, "value", 0))
+                            except Exception: adj_int = 0
+                        entry["paragraph_adjust"] = adj_int
+                        entry["alignment"] = {0:"left",1:"right",2:"justify",3:"center",4:"stretch",5:"block_line"}.get(adj_int, str(adj_int))
                         entry["left_mm"] = para.ParaLeftMargin / 100.0
                         entry["right_mm"] = para.ParaRightMargin / 100.0
                         entry["first_line_mm"] = para.ParaFirstLineIndent / 100.0
@@ -1314,6 +2050,36 @@ class UNOBridge:
                             entry["numbering_rule_name"] = getattr(nr, "Name", "") if nr else ""
                         except Exception:
                             entry["numbering_rule_name"] = ""
+                        try: entry["char_height"] = float(getattr(para, "CharHeight", 0) or 0)
+                        except Exception: entry["char_height"] = None
+                        # Text-flow (см. комментарий в get_paragraphs)
+                        try: entry["widows"] = int(getattr(para, "ParaWidows", 0) or 0)
+                        except Exception: entry["widows"] = 0
+                        try: entry["orphans"] = int(getattr(para, "ParaOrphans", 0) or 0)
+                        except Exception: entry["orphans"] = 0
+                        try: entry["keep_together"] = bool(getattr(para, "ParaKeepTogether", False))
+                        except Exception: entry["keep_together"] = False
+                        try: entry["split_paragraph"] = bool(getattr(para, "ParaSplit", True))
+                        except Exception: entry["split_paragraph"] = True
+                        try:
+                            kwn = getattr(para, "ParaKeepWithNext", None)
+                            if kwn is None:
+                                kwn = getattr(para, "KeepWithNext", False)
+                            entry["keep_with_next"] = bool(kwn)
+                        except Exception: entry["keep_with_next"] = False
+                        # BreakType / PageDescName тоже нужны для diff
+                        try:
+                            entry["page_desc_name"] = getattr(para, "PageDescName", "") or ""
+                        except Exception:
+                            entry["page_desc_name"] = ""
+                        try:
+                            bt = getattr(para, "BreakType", 0)
+                            if hasattr(bt, "value"):
+                                entry["break_type"] = int(bt.value)
+                            else:
+                                entry["break_type"] = int(bt) if isinstance(bt, (int, float)) else 0
+                        except Exception:
+                            entry["break_type"] = 0
                     except Exception as fe:
                         entry["format_error"] = str(fe)
                 # Enumerate text portions inside the paragraph
@@ -1334,10 +2100,19 @@ class UNOBridge:
                             run["font_name"] = portion.CharFontName
                             run["font_size"] = portion.CharHeight
                             run["bold"] = portion.CharWeight >= 150
-                            # CharPosture: NONE=0, OBLIQUE=1, ITALIC=2, DONTKNOW=4, REVERSE_OBLIQUE=5, REVERSE_ITALIC=6
-                            # Treat only true italic values as italic. OBLIQUE renders slanted but is rare and
-                            # was producing false positives where every body run came back italic=true.
-                            run["italic"] = portion.CharPosture in (2, 6)
+                            # CharPosture is com.sun.star.awt.FontSlant enum. In Python UNO,
+                            # `.value` returns the NAME string ("NONE","OBLIQUE","ITALIC",
+                            # "DONTKNOW","REVERSE_OBLIQUE","REVERSE_ITALIC"), not the int.
+                            # OBLIQUE is what Word imports use for italic.
+                            cp_name = ""
+                            try:
+                                cp = portion.CharPosture
+                                cp_name = getattr(cp, "value", None) or str(cp) or ""
+                            except Exception:
+                                cp_name = ""
+                            run["italic"] = cp_name in ("OBLIQUE", "ITALIC",
+                                                          "REVERSE_OBLIQUE", "REVERSE_ITALIC")
+                            run["char_posture"] = cp_name
                             run["underline"] = portion.CharUnderline != 0
                             run["strike"] = bool(getattr(portion, "CharStrikeout", 0))
                             run["color"] = self._int_to_hex(portion.CharColor)
@@ -1349,6 +2124,17 @@ class UNOBridge:
                             cstyle = getattr(portion, "CharStyleName", "")
                             if cstyle:
                                 run["char_style"] = cstyle
+                            # Per-portion kerning (1/100 mm) and scale width (%).
+                            # Source docs sometimes set per-space kerning to push justify
+                            # rendering wider — without this, target wraps differently.
+                            try:
+                                k = int(getattr(portion, "CharKerning", 0) or 0)
+                                if k != 0: run["kerning"] = k
+                            except Exception: pass
+                            try:
+                                sw = int(getattr(portion, "CharScaleWidth", 100) or 100)
+                                if sw != 100: run["scale_width"] = sw
+                            except Exception: pass
                         except Exception as re:
                             run["run_error"] = str(re)
                         runs.append(run)
@@ -1357,6 +2143,87 @@ class UNOBridge:
                 entry["runs"] = runs
                 out.append(entry)
             return {"success": True, "paragraphs": out, "returned": len(out)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def list_body_elements(self, start: int = 0, count: int = None,
+                           preview_chars: int = 60) -> Dict[str, Any]:
+        """Iterate the document body and return ordered paragraphs **and**
+        tables (TextTable) with positional metadata.
+
+        Unlike _iter_paragraphs (which silently skips tables), this exposes
+        the absolute order needed to reconstruct mixed paragraph/table flows.
+        Each paragraph entry mirrors the index produced by get_paragraphs.
+        Tables include their name, dimensions, and the index of the
+        paragraph immediately before them — that's what the batch reproducer
+        uses to insert a table at the right anchor in the rebuilt body.
+
+        anchor_offset uses the same offset accounting as _iter_paragraphs
+        (offset += len(getString()) + 1 per element) — only meaningful
+        relative to other elements in this same enumeration.
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            text = doc.getText()
+            enum = text.createEnumeration()
+            offset = 0
+            para_idx = 0
+            elements = []
+            last_para_idx = -1
+            seq = 0
+            while enum.hasMoreElements():
+                elem = enum.nextElement()
+                if elem.supportsService("com.sun.star.text.Paragraph"):
+                    s = elem.getString()
+                    if seq >= start and (count is None or len(elements) < count):
+                        elements.append({
+                            "kind": "paragraph",
+                            "index": para_idx,
+                            "start": offset,
+                            "end": offset + len(s),
+                            "preview": s[:preview_chars] + ("…" if len(s) > preview_chars else ""),
+                        })
+                    last_para_idx = para_idx
+                    offset += len(s) + 1
+                    para_idx += 1
+                    seq += 1
+                elif elem.supportsService("com.sun.star.text.TextTable"):
+                    if seq >= start and (count is None or len(elements) < count):
+                        try:
+                            rows = elem.getRows().getCount()
+                            cols = elem.getColumns().getCount()
+                        except Exception:
+                            rows, cols = 0, 0
+                        try:
+                            tname = elem.getName()
+                        except Exception:
+                            tname = ""
+                        elements.append({
+                            "kind": "table",
+                            "name": tname,
+                            "after_paragraph_index": last_para_idx,
+                            "anchor_offset": offset,
+                            "rows": rows,
+                            "columns": cols,
+                        })
+                    try:
+                        s = elem.getString()
+                        offset += len(s) + 1
+                    except Exception:
+                        offset += 1
+                    seq += 1
+                else:
+                    # Unknown element — keep offset accounting consistent
+                    try:
+                        s = elem.getString()
+                        offset += len(s) + 1
+                    except Exception:
+                        offset += 1
+                    seq += 1
+            return {"success": True, "elements": elements,
+                    "returned": len(elements)}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -1372,18 +2239,27 @@ class UNOBridge:
             cursor.goRight(int(start), False)
             length = 1 if end is None or end == start else int(end - start)
             cursor.goRight(length, True)
-            return {"success": True, "format": {
+            fmt = {
                 "start": start,
                 "end": start + length,
                 "text": cursor.getString(),
                 "font_name": cursor.CharFontName,
                 "font_size": cursor.CharHeight,
                 "bold": cursor.CharWeight >= 150,
-                "italic": cursor.CharPosture in (2, 6),
+                "italic": (getattr(cursor.CharPosture, "value", None) or str(cursor.CharPosture)) in ("OBLIQUE", "ITALIC", "REVERSE_OBLIQUE", "REVERSE_ITALIC"),
                 "underline": cursor.CharUnderline != 0,
                 "color": self._int_to_hex(cursor.CharColor),
                 "background_color": self._int_to_hex(cursor.CharBackColor),
-            }}
+            }
+            # Per-character spacing — Word imports often set CharKerning on
+            # specific portions (e.g. expanded spacing on bold names) to widen
+            # justify wraps. Without surfacing it here, agents can't diff or
+            # replicate it.
+            try: fmt["kerning"] = int(getattr(cursor, "CharKerning", 0) or 0)
+            except Exception: pass
+            try: fmt["scale_width"] = int(getattr(cursor, "CharScaleWidth", 100) or 100)
+            except Exception: pass
+            return {"success": True, "format": fmt}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -1419,7 +2295,8 @@ class UNOBridge:
                         "available": list(para.getElementNames())}
             st = para.getByName(style_name)
             align_map_rev = {0: "left", 1: "right", 2: "justify", 3: "center"}
-            posture = getattr(st, "CharPosture", 0)
+            posture_raw = getattr(st, "CharPosture", 0)
+            posture_name = getattr(posture_raw, "value", None) or str(posture_raw) or ""
             d = {
                 "name": st.Name,
                 "display_name": getattr(st, "DisplayName", st.Name),
@@ -1428,7 +2305,7 @@ class UNOBridge:
                 "font_name": getattr(st, "CharFontName", None),
                 "font_size": getattr(st, "CharHeight", None),
                 "bold": getattr(st, "CharWeight", 100) >= 150,
-                "italic": posture in (2, 6),
+                "italic": posture_name in ("OBLIQUE", "ITALIC", "REVERSE_OBLIQUE", "REVERSE_ITALIC"),
                 "underline": getattr(st, "CharUnderline", 0) != 0,
                 "char_word_mode": bool(getattr(st, "CharWordMode", False)),
                 "alignment": align_map_rev.get(getattr(st, "ParaAdjust", 0), "left"),
@@ -1460,6 +2337,16 @@ class UNOBridge:
                 d["tab_stops"] = self._encode_tab_stops(st.ParaTabStops)
             except Exception:
                 d["tab_stops"] = []
+            # Per-character spacing on the style level. Word imports may set
+            # CharKerning > 0 on entire styles (e.g. expanded headings).
+            try:
+                k = int(getattr(st, "CharKerning", 0) or 0)
+                if k != 0: d["kerning"] = k
+            except Exception: pass
+            try:
+                sw = int(getattr(st, "CharScaleWidth", 100) or 100)
+                if sw != 100: d["scale_width"] = sw
+            except Exception: pass
             return {"success": True, "style": d}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1528,6 +2415,10 @@ class UNOBridge:
                 _try(lambda v: setattr(st, "ParaOrphans", int(v)), "orphans", props["orphans"])
             if "widows" in props:
                 _try(lambda v: setattr(st, "ParaWidows", int(v)), "widows", props["widows"])
+            if "kerning" in props:
+                _try(lambda v: setattr(st, "CharKerning", int(v)), "kerning", props["kerning"])
+            if "scale_width" in props:
+                _try(lambda v: setattr(st, "CharScaleWidth", int(v)), "scale_width", props["scale_width"])
             if "parent" in props:
                 _try(lambda v: setattr(st, "ParentStyle", v or ""), "parent", props["parent"])
             if "follow" in props:
@@ -2270,6 +3161,195 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def _extract_para_with_runs(self, para) -> Dict[str, Any]:
+        """Pull paragraph metadata + per-portion runs into a JSON-serialisable
+        dict. Mirrors the schema of get_paragraphs_with_runs entries; reused
+        by read_table_rich and any other context that needs full paragraph
+        replication data."""
+        entry = {"text": para.getString()}
+        try:
+            entry["style"] = para.ParaStyleName
+            adj = para.ParaAdjust
+            try:
+                adj_int = int(adj)
+            except Exception:
+                try: adj_int = int(getattr(adj, "value", 0))
+                except Exception: adj_int = 0
+            entry["paragraph_adjust"] = adj_int
+            entry["alignment"] = {0:"left",1:"right",2:"justify",3:"center",
+                                  4:"stretch",5:"block_line"}.get(adj_int, str(adj_int))
+            entry["left_mm"] = para.ParaLeftMargin / 100.0
+            entry["right_mm"] = para.ParaRightMargin / 100.0
+            entry["first_line_mm"] = para.ParaFirstLineIndent / 100.0
+            entry["top_mm"] = getattr(para, "ParaTopMargin", 0) / 100.0
+            entry["bottom_mm"] = getattr(para, "ParaBottomMargin", 0) / 100.0
+            try:
+                entry["tab_stops"] = self._encode_tab_stops(para.ParaTabStops)
+            except Exception:
+                entry["tab_stops"] = []
+            ls = para.ParaLineSpacing
+            entry["line_spacing"] = {
+                "mode": ["proportional","minimum","leading","fix"][ls.Mode]
+                        if ls.Mode in (0,1,2,3) else ls.Mode,
+                "value": ls.Height if ls.Mode == 0 else ls.Height / 100.0}
+            try:
+                entry["context_margin"] = bool(getattr(para, "ParaContextMargin", False))
+            except Exception:
+                entry["context_margin"] = False
+        except Exception as fe:
+            entry["format_error"] = str(fe)
+        runs = []
+        try:
+            pen = para.createEnumeration()
+            while pen.hasMoreElements():
+                portion = pen.nextElement()
+                try:
+                    ptype = getattr(portion, "TextPortionType", "Text")
+                except Exception:
+                    ptype = "Text"
+                s = portion.getString()
+                if not s and ptype == "Text":
+                    continue
+                run = {"type": ptype, "text": s}
+                try:
+                    run["font_name"] = portion.CharFontName
+                    run["font_size"] = portion.CharHeight
+                    run["bold"] = portion.CharWeight >= 150
+                    cp_name = ""
+                    try:
+                        cp = portion.CharPosture
+                        cp_name = getattr(cp, "value", None) or str(cp) or ""
+                    except Exception:
+                        cp_name = ""
+                    run["italic"] = cp_name in ("OBLIQUE", "ITALIC",
+                                                 "REVERSE_OBLIQUE", "REVERSE_ITALIC")
+                    run["underline"] = portion.CharUnderline != 0
+                    run["color"] = self._int_to_hex(portion.CharColor)
+                    if getattr(portion, "CharBackColor", -1) not in (-1, 0xFFFFFFFF):
+                        run["background_color"] = self._int_to_hex(portion.CharBackColor)
+                    url = getattr(portion, "HyperLinkURL", "")
+                    if url:
+                        run["hyperlink"] = url
+                    cstyle = getattr(portion, "CharStyleName", "")
+                    if cstyle:
+                        run["char_style"] = cstyle
+                    try:
+                        k = int(getattr(portion, "CharKerning", 0) or 0)
+                        if k != 0: run["kerning"] = k
+                    except Exception: pass
+                    try:
+                        sw = int(getattr(portion, "CharScaleWidth", 100) or 100)
+                        if sw != 100: run["scale_width"] = sw
+                    except Exception: pass
+                except Exception as re:
+                    run["run_error"] = str(re)
+                runs.append(run)
+        except Exception as ee:
+            entry["runs_error"] = str(ee)
+        entry["runs"] = runs
+        return entry
+
+    def read_table_rich(self, table_name: str = None,
+                        table_index: int = None) -> Dict[str, Any]:
+        """Read each cell as a list of paragraphs with runs (the same shape
+        emitted by get_paragraphs_with_runs). Use this to faithfully replicate
+        a table — read_table_cells only returns plain text and loses font /
+        bold / alignment / indent inside cells."""
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            tables = doc.getTextTables()
+            if table_name:
+                if not tables.hasByName(table_name):
+                    return {"success": False, "error": f"no table named '{table_name}'"}
+                t = tables.getByName(table_name)
+            elif table_index is not None:
+                if table_index < 0 or table_index >= tables.getCount():
+                    return {"success": False, "error": "table_index out of range"}
+                t = tables.getByIndex(table_index)
+            else:
+                if tables.getCount() == 0:
+                    return {"success": False, "error": "no tables"}
+                t = tables.getByIndex(0)
+            rows = t.getRows().getCount()
+            cols = t.getColumns().getCount()
+            # Column widths — критично для replicate. UNO хранит их через
+            # TableColumnSeparators (массив N-1 точек разреза 0..10000 в
+            # relative units от ширины таблицы) + Width (абсолют 1/100 mm).
+            # Без этого insert_table в target создаёт колонки одинаковой
+            # ширины, и текст в узких ячейках получается уродливо растянут
+            # (особенно при ParaAdjust=BLOCK_LINE).
+            column_widths_mm = []
+            table_width_mm = None
+            try:
+                tw = int(getattr(t, "Width", 0) or 0)
+                if tw > 0:
+                    table_width_mm = tw / 100.0
+                    seps = list(getattr(t, "TableColumnSeparators", []) or [])
+                    prev = 0
+                    for sep in seps:
+                        column_widths_mm.append((sep.Position - prev) * tw / 10000.0 / 100.0)
+                        prev = sep.Position
+                    column_widths_mm.append((10000 - prev) * tw / 10000.0 / 100.0)
+            except Exception:
+                pass
+            # Table-level page-break behaviour. Without Split=True the table
+            # cannot span pages — when it doesn't fit on the current page it
+            # jumps wholesale to the next, leaving a big empty gap.
+            # RepeatHeadline + HeaderRowCount control whether the header row
+            # repeats at the top of every page the table spans.
+            try: t_split = bool(getattr(t, "Split", True))
+            except Exception: t_split = True
+            try: t_repeat = bool(getattr(t, "RepeatHeadline", False))
+            except Exception: t_repeat = False
+            try: t_header_rows = int(getattr(t, "HeaderRowCount", 0) or 0)
+            except Exception: t_header_rows = 0
+            try: t_keep_together = bool(getattr(t, "KeepTogether", False))
+            except Exception: t_keep_together = False
+            grid = []
+            for r in range(rows):
+                row_arr = []
+                for c in range(cols):
+                    cn = chr(ord("A") + c) + str(r + 1)
+                    try:
+                        cell = t.getCellByName(cn)
+                    except Exception:
+                        cell = None
+                    if cell is None:
+                        row_arr.append({"name": cn, "paragraphs": []})
+                        continue
+                    paras = []
+                    try:
+                        ctext = cell.getText()
+                        cenum = ctext.createEnumeration()
+                        while cenum.hasMoreElements():
+                            elem = cenum.nextElement()
+                            if not elem.supportsService("com.sun.star.text.Paragraph"):
+                                continue
+                            paras.append(self._extract_para_with_runs(elem))
+                    except Exception as ce:
+                        row_arr.append({"name": cn, "paragraphs": [],
+                                        "error": str(ce)})
+                        continue
+                    cell_entry = {"name": cn, "paragraphs": paras}
+                    # Per-cell vertical alignment (TOP=0,CENTER=1,BOTTOM=2)
+                    try:
+                        va = cell.VertOrient
+                        cell_entry["vert_orient"] = int(getattr(va, "value", va)) if not isinstance(va, int) else va
+                    except Exception: pass
+                    row_arr.append(cell_entry)
+                grid.append(row_arr)
+            return {"success": True, "name": t.getName(), "rows": rows,
+                    "columns": cols, "table_width_mm": table_width_mm,
+                    "column_widths_mm": column_widths_mm,
+                    "split": t_split, "repeat_headline": t_repeat,
+                    "header_row_count": t_header_rows,
+                    "keep_together": t_keep_together,
+                    "cells": grid}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def get_selection(self) -> Dict[str, Any]:
         doc, err = self._require_writer()
         if err:
@@ -2401,6 +3481,127 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def insert_text_frame(self, paragraph_index: int = None,
+                          width_mm: float = 6.7, height_mm: float = 4.94,
+                          text: str = None, page_number: bool = False,
+                          hori_orient: str = "center", vert_orient: str = "bottom",
+                          hori_relation: str = "page", vert_relation: str = "page",
+                          x_mm: float = 0.0, y_mm: float = 0.0,
+                          back_transparent: bool = True,
+                          remove_borders: bool = True) -> Dict[str, Any]:
+        """Insert a TextFrame anchored to a paragraph (AT_PARAGRAPH).
+        Supports embedding a PageNumber field via page_number=True OR plain
+        text via `text`. Use this to replicate Word's docshape page-number
+        boxes that sit at page bottoms outside of FooterText.
+
+        hori_orient/vert_orient: 'left'|'center'|'right'|'top'|'bottom'|'none'
+        relation: 'frame'|'paragraph'|'page'|'page-text-area'
+        x_mm/y_mm used only when orient='none' (manual offset).
+        """
+        doc, err = self._require_writer()
+        if err: return err
+        try:
+            text_obj = doc.getText()
+            target = None
+            if paragraph_index is not None:
+                pe = text_obj.createEnumeration()
+                i = 0
+                while pe.hasMoreElements():
+                    p = pe.nextElement()
+                    if p.supportsService("com.sun.star.text.Paragraph"):
+                        if i == paragraph_index:
+                            target = p; break
+                        i += 1
+                if target is None:
+                    return {"success": False, "error": f"paragraph {paragraph_index} not found"}
+            anchor = target if target is not None else text_obj.createTextCursor()
+
+            frame = doc.createInstance("com.sun.star.text.TextFrame")
+            sz = uno.createUnoStruct("com.sun.star.awt.Size")
+            sz.Width = int(float(width_mm) * 100)
+            sz.Height = int(float(height_mm) * 100)
+            frame.Size = sz
+
+            text_obj.insertTextContent(anchor.getStart() if hasattr(anchor, "getStart") else text_obj.getEnd(),
+                                       frame, False)
+
+            # AnchorType set after insertion (some props lock once attached)
+            try:
+                from com.sun.star.text.TextContentAnchorType import AT_PARAGRAPH
+                frame.AnchorType = AT_PARAGRAPH
+            except Exception: pass
+
+            # com.sun.star.text.HoriOrientation: NONE=0, RIGHT=1, CENTER=2,
+            # LEFT=3, INSIDE=4, OUTSIDE=5, FULL=6.
+            HORI_MAP = {"none": 0, "right": 1, "center": 2, "left": 3,
+                        "inside": 4, "outside": 5, "full": 6}
+            # com.sun.star.text.VertOrientation: NONE=0, TOP=1, CENTER=2,
+            # BOTTOM=3, CHAR_TOP=4, ..., LINE_BOTTOM=8.
+            VERT_MAP = {"none": 0, "top": 1, "center": 2, "bottom": 3,
+                        "char_top": 4, "char_center": 5, "char_bottom": 6,
+                        "line_top": 7, "line_center": 8, "line_bottom": 9}
+            # com.sun.star.text.RelOrientation: FRAME=0, PRINT_AREA=1,
+            # CHAR=2, PAGE_LEFT=3, PAGE_RIGHT=4, FRAME_LEFT=5, FRAME_RIGHT=6,
+            # PAGE_FRAME=7, PAGE_PRINT_AREA=8, TEXT_LINE=9.
+            # Common aliases: 'page' = PAGE_FRAME (7), 'page-text-area' =
+            # PAGE_PRINT_AREA (8), 'paragraph' = FRAME (0).
+            REL_MAP = {"frame": 0, "paragraph": 0, "print_area": 1,
+                       "char": 2, "page-left": 3, "page-right": 4,
+                       "frame-left": 5, "frame-right": 6,
+                       "page": 7, "page-frame": 7,
+                       "page-text-area": 8, "page-print-area": 8,
+                       "page-content": 8, "text-line": 9}
+            try: frame.HoriOrient = HORI_MAP.get(hori_orient.lower(), 2)
+            except Exception: pass
+            try: frame.VertOrient = VERT_MAP.get(vert_orient.lower(), 3)
+            except Exception: pass
+            try: frame.HoriOrientRelation = REL_MAP.get(hori_relation.lower(), 7)
+            except Exception: pass
+            try: frame.VertOrientRelation = REL_MAP.get(vert_relation.lower(), 7)
+            except Exception: pass
+            if hori_orient.lower() == "none":
+                try: frame.HoriOrientPosition = int(float(x_mm) * 100)
+                except Exception: pass
+            else:
+                # Some LO versions need an explicit zero offset alongside
+                # orient=center, otherwise leftover positions kick in.
+                try: frame.HoriOrientPosition = 0
+                except Exception: pass
+            if vert_orient.lower() == "none":
+                try: frame.VertOrientPosition = int(float(y_mm) * 100)
+                except Exception: pass
+            else:
+                try: frame.VertOrientPosition = 0
+                except Exception: pass
+            if back_transparent:
+                try: frame.BackTransparent = True
+                except Exception: pass
+            if remove_borders:
+                try:
+                    bl = uno.createUnoStruct("com.sun.star.table.BorderLine2")
+                    bl.OuterLineWidth = 0
+                    for bp in ("LeftBorder", "RightBorder", "TopBorder", "BottomBorder"):
+                        try: setattr(frame, bp, bl)
+                        except Exception: pass
+                except Exception: pass
+
+            # Insert content into the frame
+            ftxt = frame.getText()
+            cur = ftxt.createTextCursor()
+            if page_number:
+                fld = doc.createInstance("com.sun.star.text.TextField.PageNumber")
+                try:
+                    from com.sun.star.style.NumberingType import ARABIC
+                    fld.NumberingType = ARABIC
+                except Exception: pass
+                ftxt.insertTextContent(cur, fld, False)
+            elif text:
+                ftxt.insertString(cur, text, False)
+            return {"success": True, "name": frame.Name,
+                    "anchor_paragraph_index": paragraph_index}
+        except Exception as e:
+            return {"success": False, "error": str(e), "trace": traceback.format_exc()}
+
     def insert_image(self, path: str, position: int = None,
                      width_mm: float = None, height_mm: float = None) -> Dict[str, Any]:
         doc, err = self._require_writer()
@@ -2433,7 +3634,20 @@ class UNOBridge:
             return {"success": False, "error": str(e)}
 
     def insert_table(self, rows: int, columns: int, position: int = None,
-                     name: str = None) -> Dict[str, Any]:
+                     name: str = None, column_widths_mm: list = None,
+                     table_width_mm: float = None,
+                     split: bool = None, repeat_headline: bool = None,
+                     header_row_count: int = None,
+                     keep_together: bool = None) -> Dict[str, Any]:
+        """Insert a TextTable.
+
+        column_widths_mm: optional list of width per column (mm) — applied
+            via TableColumnSeparators after insertion. Critical for tables
+            where one column is much narrower/wider; without it all columns
+            are equal width and text in narrow cells gets brutally wrapped.
+        table_width_mm: total table width in mm. If omitted, derived from
+            sum(column_widths_mm) or left at default.
+        """
         doc, err = self._require_writer()
         if err:
             return err
@@ -2449,7 +3663,51 @@ class UNOBridge:
                 cursor = text_obj.createTextCursor()
                 cursor.gotoEnd(False)
             text_obj.insertTextContent(cursor, table, False)
-            return {"success": True, "name": table.getName(), "rows": rows, "columns": columns}
+            # Apply column widths AFTER insertion (table.Width / Separators
+            # don't take effect until the table is in the doc).
+            applied_cols = None
+            if column_widths_mm:
+                try:
+                    widths = [float(w) for w in column_widths_mm if w is not None]
+                    if len(widths) == columns and all(w > 0 for w in widths):
+                        # Set TableWidth first if requested
+                        if table_width_mm is None:
+                            table_width_mm = sum(widths)
+                        try: table.Width = int(float(table_width_mm) * 100)
+                        except Exception: pass
+                        # Build TableColumnSeparators (n-1 separators)
+                        total = sum(widths)
+                        cum = 0
+                        seps_existing = list(getattr(table, "TableColumnSeparators", []) or [])
+                        # We need n-1 separators with Position in 0..10000
+                        new_seps = []
+                        # createUnoStruct for each separator
+                        for i in range(columns - 1):
+                            cum += widths[i]
+                            sep = uno.createUnoStruct("com.sun.star.text.TableColumnSeparator")
+                            sep.Position = int(cum / total * 10000)
+                            sep.IsVisible = True
+                            new_seps.append(sep)
+                        table.TableColumnSeparators = tuple(new_seps)
+                        applied_cols = widths
+                except Exception as we:
+                    logger.warning(f"insert_table column_widths failed: {we}")
+            # Page-flow behaviour
+            if split is not None:
+                try: table.Split = bool(split)
+                except Exception: pass
+            if keep_together is not None:
+                try: table.KeepTogether = bool(keep_together)
+                except Exception: pass
+            if repeat_headline is not None:
+                try: table.RepeatHeadline = bool(repeat_headline)
+                except Exception: pass
+            if header_row_count is not None:
+                try: table.HeaderRowCount = int(header_row_count)
+                except Exception: pass
+            return {"success": True, "name": table.getName(),
+                    "rows": rows, "columns": columns,
+                    "applied_column_widths": applied_cols}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -2469,6 +3727,180 @@ class UNOBridge:
             return {"success": True, "table": table_name, "cell": cell, "length": len(value)}
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def _apply_run_props(self, cur, run: dict, skip_word_justify_artifacts: bool = False):
+        """Apply per-portion character properties from a run dict onto cursor.
+
+        skip_word_justify_artifacts: when True, ignore kerning and scale_width.
+            Word→ODT exporter encodes pre-applied justify-stretching as
+            per-portion CharKerning / CharScaleWidth on space portions.
+            These values are only valid at the exact original line width;
+            re-applying them on top of ParaAdjust=block_line (which itself
+            stretches to fit the new container) yields double-stretching —
+            visible in narrow table cells where text becomes visually
+            "разорванным": "п о л н о с т ь ю". Use this flag inside table
+            cells where ParaAdjust handles justification on its own.
+        """
+        if run.get("font_name"):
+            try: cur.CharFontName = run["font_name"]
+            except Exception: pass
+        if run.get("font_size") is not None:
+            try: cur.CharHeight = float(run["font_size"])
+            except Exception: pass
+        if run.get("bold"):
+            try: cur.CharWeight = 150.0
+            except Exception: pass
+        if run.get("italic"):
+            try: cur.CharPosture = uno.Enum("com.sun.star.awt.FontSlant", "ITALIC")
+            except Exception: pass
+        if run.get("underline"):
+            try: cur.CharUnderline = 1
+            except Exception: pass
+        if not skip_word_justify_artifacts:
+            if run.get("kerning") is not None:
+                try: cur.CharKerning = int(run["kerning"])
+                except Exception: pass
+            if run.get("scale_width") is not None:
+                try: cur.CharScaleWidth = int(run["scale_width"])
+                except Exception: pass
+        if run.get("color"):
+            try: cur.CharColor = self._hex_to_int(run["color"])
+            except Exception: pass
+        if run.get("background_color"):
+            try: cur.CharBackColor = self._hex_to_int(run["background_color"])
+            except Exception: pass
+        if run.get("char_style"):
+            try: cur.CharStyleName = run["char_style"]
+            except Exception: pass
+        if run.get("hyperlink"):
+            try: cur.HyperLinkURL = run["hyperlink"]
+            except Exception: pass
+
+    def _apply_paragraph_props(self, cur, p: dict):
+        """Apply per-paragraph properties (style, alignment, indent, spacing,
+        line spacing, tab stops) onto a cursor anchored inside the paragraph."""
+        if p.get("style"):
+            try: cur.ParaStyleName = p["style"]
+            except Exception: pass
+        pa = p.get("paragraph_adjust")
+        if pa is not None:
+            try: cur.ParaAdjust = int(pa)
+            except Exception: pass
+        if p.get("left_mm") is not None:
+            try: cur.ParaLeftMargin = int(float(p["left_mm"]) * 100)
+            except Exception: pass
+        if p.get("right_mm") is not None:
+            try: cur.ParaRightMargin = int(float(p["right_mm"]) * 100)
+            except Exception: pass
+        if p.get("first_line_mm") is not None:
+            try: cur.ParaFirstLineIndent = int(float(p["first_line_mm"]) * 100)
+            except Exception: pass
+        if p.get("top_mm") is not None:
+            try: cur.ParaTopMargin = int(float(p["top_mm"]) * 100)
+            except Exception: pass
+        if p.get("bottom_mm") is not None:
+            try: cur.ParaBottomMargin = int(float(p["bottom_mm"]) * 100)
+            except Exception: pass
+        ls = p.get("line_spacing") or {}
+        mode = ls.get("mode"); val = ls.get("value")
+        if mode and val is not None:
+            try:
+                from com.sun.star.style import LineSpacing as _LS
+                mode_map = {"proportional": 0, "minimum": 1, "leading": 2, "fix": 3}
+                ls_mode = mode_map.get(str(mode).lower(), 0)
+                spacing = _LS()
+                spacing.Mode = ls_mode
+                spacing.Height = int(float(val)) if ls_mode == 0 else int(float(val) * 100)
+                cur.ParaLineSpacing = spacing
+            except Exception: pass
+        if p.get("context_margin") is not None:
+            try: cur.ParaContextMargin = bool(p["context_margin"])
+            except Exception: pass
+        tabs = p.get("tab_stops") or []
+        if tabs:
+            try:
+                # Reuse same encoding-back logic as set_paragraph_tabs
+                self._apply_tab_stops(cur, tabs)
+            except Exception: pass
+
+    def _apply_tab_stops(self, cur, stops):
+        """Encode list-of-dict tab stops into a UNO TabStop[] sequence and
+        assign to cur.ParaTabStops. Mirrors set_paragraph_tabs encoding."""
+        align_map = {"left": 0, "center": 1, "right": 2, "decimal": 3}
+        out = []
+        for s in stops:
+            if not isinstance(s, dict): continue
+            t = uno.createUnoStruct("com.sun.star.style.TabStop")
+            t.Position = int(float(s.get("position_mm", 0)) * 100)
+            t.Alignment = align_map.get(str(s.get("alignment", "left")).lower(), 0)
+            fc = s.get("fill_char") or " "
+            dc = s.get("decimal_char") or "."
+            t.FillChar = ord(fc[0]) if isinstance(fc, str) and fc else 32
+            t.DecimalChar = ord(dc[0]) if isinstance(dc, str) and dc else 46
+            out.append(t)
+        cur.ParaTabStops = tuple(out)
+
+    def write_table_cell_rich(self, table_name: str, cell: str,
+                              paragraphs: list) -> Dict[str, Any]:
+        """Write a list of paragraphs (text + runs + paragraph props) into a
+        table cell, preserving formatting that read_table_rich captured.
+
+        paragraphs: list of dicts with optional keys 'text', 'style',
+            'paragraph_adjust', 'left_mm', 'right_mm', 'first_line_mm',
+            'top_mm', 'bottom_mm', 'line_spacing', 'tab_stops',
+            'context_margin', 'runs'. Each run can have 'text', 'font_name',
+            'font_size', 'bold', 'italic', 'underline', 'kerning',
+            'scale_width', 'color', 'background_color', 'hyperlink', 'char_style'.
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        if not isinstance(paragraphs, list):
+            return {"success": False, "error": "paragraphs must be a list"}
+        try:
+            tables = doc.getTextTables()
+            if not tables.hasByName(table_name):
+                return {"success": False, "error": f"no table named '{table_name}'"}
+            t = tables.getByName(table_name)
+            c = t.getCellByName(cell)
+            if c is None:
+                return {"success": False, "error": f"cell '{cell}' not found"}
+            text = c.getText()
+            text.setString("")
+            from com.sun.star.text.ControlCharacter import PARAGRAPH_BREAK
+            cursor = text.createTextCursor()
+            cursor.gotoStart(False)
+            for pi, p in enumerate(paragraphs):
+                if pi > 0:
+                    text.insertControlCharacter(cursor, PARAGRAPH_BREAK, False)
+                runs = p.get("runs") or []
+                # Insert runs with per-run formatting; if no runs, just plain text.
+                ptext = p.get("text") or ""
+                if runs:
+                    for run in runs:
+                        rt = run.get("text") or ""
+                        if not rt:
+                            continue
+                        anchor_end = cursor.getEnd()
+                        text.insertString(cursor, rt, False)
+                        sel = text.createTextCursorByRange(anchor_end)
+                        sel.gotoRange(cursor.getEnd(), True)
+                        # Skip kerning/scale_width inside table cells — Word
+                        # exporter pre-bakes justify-stretching into them at
+                        # the source column width; re-applying here on top
+                        # of ParaAdjust=block_line yields visible double
+                        # stretching ("п о л н о с т ь ю").
+                        self._apply_run_props(sel, run, skip_word_justify_artifacts=True)
+                elif ptext:
+                    text.insertString(cursor, ptext, False)
+                # Apply paragraph properties on a cursor inside the just-written paragraph
+                pcur = text.createTextCursorByRange(cursor.getEnd())
+                self._apply_paragraph_props(pcur, p)
+            return {"success": True, "table": table_name, "cell": cell,
+                    "paragraphs": len(paragraphs)}
+        except Exception as e:
+            return {"success": False, "error": str(e),
+                    "trace": traceback.format_exc()}
 
     def remove_table(self, table_name: str) -> Dict[str, Any]:
         doc, err = self._require_writer()
@@ -2688,6 +4120,51 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def set_footer_page_number(self, page_style: str = "Default Page Style",
+                               alignment: str = "center",
+                               font_size: float = None) -> Dict[str, Any]:
+        """Replace footer content with a centered (or other-aligned) PageNumber
+        field. Use this when source numbers each page and you need it
+        replicated on every page using a given page-style — far simpler than
+        anchoring per-page TextFrames. alignment: 'left'|'center'|'right'.
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            ps = self._page_style(doc, page_style)
+            if not ps.FooterIsOn:
+                ps.FooterIsOn = True
+            # Match Word→ODT export footer geometry (HeaderIsOn=false,
+            # FooterIsOn=true, FooterHeight=3.44mm, BodyDistance=0,
+            # IsDynamicHeight=true). Default UNO footer reserves more space
+            # which shifts body-area and disturbs page-break placement.
+            try: ps.FooterIsDynamicHeight = True
+            except Exception: pass
+            try: ps.FooterHeight = 344          # 3.44 mm
+            except Exception: pass
+            try: ps.FooterBodyDistance = 0
+            except Exception: pass
+            footer = ps.FooterText
+            footer.setString("")
+            cursor = footer.createTextCursor()
+            align_map = {"left": 0, "right": 1, "justify": 2, "center": 3}
+            cursor.ParaAdjust = align_map.get(str(alignment).lower(), 3)
+            if font_size is not None:
+                try: cursor.CharHeight = float(font_size)
+                except Exception: pass
+            field = doc.createInstance("com.sun.star.text.TextField.PageNumber")
+            try:
+                field.NumberingType = 4  # ARABIC
+                field.SubType = 1        # CURRENT
+            except Exception:
+                pass
+            footer.insertTextContent(cursor, field, False)
+            return {"success": True, "page_style": page_style,
+                    "alignment": alignment}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def get_header(self, page_style: str = "Default Page Style") -> Dict[str, Any]:
         doc, err = self._require_writer()
         if err:
@@ -2887,30 +4364,46 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def show_window(self) -> Dict[str, Any]:
-        """Make the active document's window visible.
-
-        Use this AFTER finishing a batch of writes on a doc that was created
-        with visible=False, to avoid the macOS SolarMutex contention that
-        happens when a worker thread mutates a visible doc many times in a
-        burst (visible doc → main-thread layout reflow → SolarMutex
-        contention → eventual deadlock).
-        """
+    def _doc_window(self, doc=None):
+        """Return the active doc's container window (or None)."""
         try:
-            doc = self.get_active_document()
-            if not doc:
-                return {"success": False, "error": "No active document"}
-            ctrl = doc.getCurrentController()
-            if ctrl is None:
-                return {"success": False, "error": "No controller"}
+            d = doc if doc is not None else self.get_active_document()
+            if d is None: return None
+            ctrl = d.getCurrentController()
+            if ctrl is None: return None
             frame = ctrl.getFrame()
-            if frame is None:
-                return {"success": False, "error": "No frame"}
-            win = frame.getContainerWindow()
-            if win is None:
-                return {"success": False, "error": "No container window"}
+            if frame is None: return None
+            return frame.getContainerWindow()
+        except Exception:
+            return None
+
+    def show_window(self) -> Dict[str, Any]:
+        """Make the active document's window visible. Pair with hide_window
+        around bulk writes that hit PageStyle / paragraph style mutations on
+        macOS — visible-window paint cycles hold SolarMutex and deadlock the
+        HTTP-worker thread."""
+        win = self._doc_window()
+        if win is None:
+            return {"success": False, "error": "No container window"}
+        try:
             win.setVisible(True)
             return {"success": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def hide_window(self) -> Dict[str, Any]:
+        """Hide the active document's window. Use BEFORE a burst of
+        clone_page_style / clone_paragraph_style / set_page_style_props /
+        set_paragraph_style_props on macOS, then call show_window() after.
+        Document model stays alive — only the visual frame is detached.
+        execute_batch with auto_hide=true does this automatically."""
+        win = self._doc_window()
+        if win is None:
+            return {"success": False, "error": "No container window"}
+        try:
+            was_visible = bool(win.isVisible())
+            win.setVisible(False)
+            return {"success": True, "was_visible": was_visible}
         except Exception as e:
             return {"success": False, "error": str(e)}
 

@@ -66,6 +66,20 @@ class LibreOfficeMCPServer:
             "handler": lambda: self.uno_bridge.show_window(),
         }
 
+        self.tools["hide_window"] = {
+            "description": (
+                "Hide the active document's window. Use before a burst of "
+                "clone_page_style / clone_paragraph_style / set_page_style_props "
+                "/ set_paragraph_style_props on macOS to avoid SolarMutex "
+                "deadlock with AppKit paint cycles. Pair with show_window "
+                "afterwards. Returns was_visible so caller can restore prior "
+                "state. execute_batch with auto_hide='auto' (default) does "
+                "this automatically when heavy ops are detected."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+            "handler": lambda: self.uno_bridge.hide_window(),
+        }
+
         self.tools["shutdown_application"] = {
             "description": (
                 "Cleanly terminate LibreOffice via Desktop.terminate(). Use for "
@@ -130,6 +144,8 @@ class LibreOfficeMCPServer:
                     "underline": {"type": "boolean"},
                     "font_size": {"type": "number", "description": "Font size in points"},
                     "font_name": {"type": "string", "description": "Font family name"},
+                    "kerning": {"type": "integer", "description": "Per-char extra horizontal spacing in 1/100 mm (CharKerning)"},
+                    "scale_width": {"type": "integer", "description": "Horizontal scale percent (CharScaleWidth, 100 = normal)"},
                     "start": {"type": "integer", "description": "Char offset (incl.)"},
                     "end": {"type": "integer", "description": "Char offset (excl.)"},
                 },
@@ -263,6 +279,71 @@ class LibreOfficeMCPServer:
                 self.uno_bridge.set_paragraph_tabs(stops, start, end),
         }
 
+        self.tools["set_footer_page_number"] = {
+            "description": (
+                "Replace the footer of a page-style with a single PageNumber "
+                "field at the given alignment ('left'|'center'|'right'). "
+                "Use to replicate page numbers across every page that uses "
+                "this style — much simpler than anchoring TextFrames per page."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "page_style": {"type": "string", "default": "Default Page Style"},
+                    "alignment": {"type": "string", "enum": ["left", "center", "right"], "default": "center"},
+                    "font_size": {"type": "number"},
+                },
+            },
+            "handler": lambda **kw: self.uno_bridge.set_footer_page_number(**kw),
+        }
+
+        self.tools["set_paragraph_text_flow"] = {
+            "description": (
+                "Set per-paragraph text-flow properties (widows, orphans, "
+                "keep_together, split_paragraph, keep_with_next). These "
+                "control how the paragraph breaks across pages and prevent "
+                "single-word/single-line spillover onto the next page. "
+                "Word→ODT often sets these per paragraph — replicate via "
+                "get_paragraphs (which now exposes them) → this setter."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "widows": {"type": "integer"},
+                    "orphans": {"type": "integer"},
+                    "keep_together": {"type": "boolean"},
+                    "split_paragraph": {"type": "boolean"},
+                    "keep_with_next": {"type": "boolean"},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
+                },
+            },
+            "handler": lambda **kw: self.uno_bridge.set_paragraph_text_flow(**kw),
+        }
+
+        self.tools["set_paragraph_breaks"] = {
+            "description": (
+                "Set BreakType / PageDescName / PageNumberOffset on paragraphs. "
+                "break_type: int 0..6 or name (NONE, COLUMN_BEFORE, COLUMN_AFTER, "
+                "COLUMN_BOTH, PAGE_BEFORE, PAGE_AFTER, PAGE_BOTH). PAGE_BEFORE=4 "
+                "forces a page break before the paragraph — needed to replicate "
+                "the visual page layout of Word-imported documents (which encode "
+                "such breaks as a paragraph property, NOT as a control character). "
+                "page_desc_name optionally switches page-style at the break."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "break_type": {"type": ["integer", "string"]},
+                    "page_desc_name": {"type": "string"},
+                    "page_number_offset": {"type": "integer"},
+                    "start": {"type": "integer"},
+                    "end": {"type": "integer"},
+                },
+            },
+            "handler": lambda **kw: self.uno_bridge.set_paragraph_breaks(**kw),
+        }
+
         self.tools["set_line_spacing"] = {
             "description": "Set line spacing. proportional: value=100 single, 150=1.5x, 200=double. fix/minimum/leading: value in mm. Pass start/end for explicit range.",
             "parameters": {
@@ -383,7 +464,7 @@ class LibreOfficeMCPServer:
         }
 
         self.tools["get_paragraphs_with_runs"] = {
-            "description": "Like get_paragraphs but also returns inline character runs per paragraph (text portions with uniform formatting): font, size, bold/italic/underline/strike, color, hyperlink URL, char style. Use this for faithful Markdown/HTML export when inline formatting matters.",
+            "description": "Like get_paragraphs but also returns inline character runs per paragraph (text portions with uniform formatting): font, size, bold/italic/underline/strike, color, hyperlink URL, char style, char_posture (NONE/OBLIQUE/ITALIC), and per-character spacing (`kerning` in 1/100 mm — surfaces only when non-zero; Word imports often set this on space portions between bold names to widen the line; without replicating, justify-wraps will diverge), `scale_width` (CharScaleWidth percent — only when ≠100). Use for faithful diff/replication when inline formatting matters.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -395,8 +476,30 @@ class LibreOfficeMCPServer:
             "handler": lambda **kw: self.uno_bridge.get_paragraphs_with_runs(**kw),
         }
 
+        self.tools["list_body_elements"] = {
+            "description": (
+                "Return the ordered sequence of paragraphs AND tables in the "
+                "document body. Each entry has 'kind' = 'paragraph' or 'table'. "
+                "Tables include 'name', 'rows', 'columns', and "
+                "'after_paragraph_index' — the paragraph the table sits "
+                "immediately after. Use this to faithfully replicate documents "
+                "where tables interleave with text — get_paragraphs and "
+                "get_paragraphs_with_runs silently skip tables, so a batch "
+                "rebuilder loses their positions otherwise."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "integer", "default": 0},
+                    "count": {"type": "integer"},
+                    "preview_chars": {"type": "integer", "default": 60},
+                },
+            },
+            "handler": lambda **kw: self.uno_bridge.list_body_elements(**kw),
+        }
+
         self.tools["get_character_format"] = {
-            "description": "Read character formatting (font, size, bold/italic/underline, color, bg color) over a char range. Pass only `start` to read a single character.",
+            "description": "Read character formatting (font, size, bold/italic/underline, color, bg color, kerning, scale_width) over a char range. `kerning` is per-char extra horizontal spacing in 1/100 mm — Word imports often set non-zero kerning on individual portions (e.g. spaces between bold names) to widen justify rendering. Pass only `start` to read a single character.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -446,6 +549,62 @@ class LibreOfficeMCPServer:
             "description": "List NumberingStyle names available in the active doc. Use to discover what auto-numbering rules exist before apply_numbering / clone_numbering_rule.",
             "parameters": {"type": "object", "properties": {}},
             "handler": lambda: self.uno_bridge.list_numbering_styles(),
+        }
+
+
+        self.tools["list_text_frames"] = {
+            "description": "List TextFrames (free-floating boxes) in a doc with text, size, position, anchor and any TextFields inside them. Page numbers visible at page bottoms are often inside TextFrames anchored to body paragraphs, NOT in the page-style's footer slot — so list_text_frames reveals what list_page_styles + dump_page_style_footer cannot.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_path": {"type": "string"},
+                    "doc_title": {"type": "string"},
+                },
+            },
+            "handler": lambda source_path=None, doc_title=None:
+                self.uno_bridge.list_text_frames(source_path=source_path, doc_title=doc_title),
+        }
+
+        self.tools["list_text_fields"] = {
+            "description": "List all TextFields in a doc (body + headers/footers + frames) with their service names, presentations, and anchor text. Reveals PageNumber/Date/etc. fields invisible to getString() — useful when reproducing footers that show '1' but FooterText.getString() returns empty.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_path": {"type": "string"},
+                    "doc_title": {"type": "string"},
+                },
+            },
+            "handler": lambda source_path=None, doc_title=None:
+                self.uno_bridge.list_text_fields(source_path=source_path, doc_title=doc_title),
+        }
+
+        self.tools["dump_char_style"] = {
+            "description": "Read a character style's properties (font/size/weight/etc) from any open doc. Compare label-rendering chars styles between source and target.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "style_name": {"type": "string"},
+                    "source_path": {"type": "string"},
+                    "doc_title": {"type": "string"},
+                },
+                "required": ["style_name"],
+            },
+            "handler": lambda style_name, source_path=None, doc_title=None:
+                self.uno_bridge.dump_char_style(style_name=style_name, source_path=source_path, doc_title=doc_title),
+        }
+
+        self.tools["dump_doc_paragraph"] = {
+            "description": "Read a paragraph's full props + numbering-rule level props as JSON-safe primitives from any open doc by source_path or doc_title. Use to diff source vs target without switching active document.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source_path": {"type": "string"},
+                    "doc_title": {"type": "string"},
+                    "paragraph_index": {"type": "integer", "default": 0},
+                },
+            },
+            "handler": lambda source_path=None, doc_title=None, paragraph_index=0:
+                self.uno_bridge.dump_doc_paragraph(source_path=source_path, doc_title=doc_title, paragraph_index=paragraph_index),
         }
 
         self.tools["clone_numbering_rule"] = {
@@ -522,8 +681,9 @@ class LibreOfficeMCPServer:
                 "underline, color, char_word_mode, alignment, left/right/first_line/"
                 "top/bottom margins (mm), context_margin, line_spacing {mode, value}, "
                 "tab_stops, outline_level, parent, follow, keep_together, "
-                "split_paragraph, orphans, widows. Pair with set_paragraph_style_props "
-                "to write any subset back."
+                "split_paragraph, orphans, widows, kerning (CharKerning, 1/100 mm; "
+                "only when ≠0), scale_width (CharScaleWidth %; only when ≠100). "
+                "Pair with set_paragraph_style_props to write any subset back."
             ),
             "parameters": {
                 "type": "object",
@@ -543,7 +703,7 @@ class LibreOfficeMCPServer:
                 "context_margin, line_spacing ({mode, value}), tab_stops "
                 "(list of {position_mm, alignment, fill_char, decimal_char}), "
                 "outline_level, keep_together, split_paragraph, orphans, widows, "
-                "parent, follow."
+                "kerning (1/100 mm), scale_width (%), parent, follow."
             ),
             "parameters": {
                 "type": "object",
@@ -570,6 +730,8 @@ class LibreOfficeMCPServer:
                     "split_paragraph": {"type": "boolean"},
                     "orphans": {"type": "integer"},
                     "widows": {"type": "integer"},
+                    "kerning": {"type": "integer", "description": "Per-char extra horizontal spacing in 1/100 mm"},
+                    "scale_width": {"type": "integer", "description": "Horizontal char scale percent (100=normal)"},
                     "parent": {"type": "string"},
                     "follow": {"type": "string"},
                 },
@@ -802,6 +964,29 @@ class LibreOfficeMCPServer:
             "parameters": {"type": "object", "properties": {}},
             "handler": lambda: self.uno_bridge.list_images(),
         }
+        self.tools["insert_text_frame"] = {
+            "description": "Insert a TextFrame anchored AT_PARAGRAPH containing either plain text or a PageNumber field (page_number=true). Use to replicate Word docshape page numbers that sit at page bottoms outside FooterText. Pair with list_text_frames to discover what to replicate.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paragraph_index": {"type": "integer", "description": "Anchor paragraph index in body"},
+                    "width_mm": {"type": "number", "default": 6.7},
+                    "height_mm": {"type": "number", "default": 4.94},
+                    "text": {"type": "string", "description": "Plain text content (mutex with page_number)"},
+                    "page_number": {"type": "boolean", "default": False, "description": "Insert PageNumber field (auto-renders 1,2,3,...)"},
+                    "hori_orient": {"type": "string", "default": "center"},
+                    "vert_orient": {"type": "string", "default": "bottom"},
+                    "hori_relation": {"type": "string", "default": "page"},
+                    "vert_relation": {"type": "string", "default": "page"},
+                    "x_mm": {"type": "number", "description": "Manual x offset (only when hori_orient='none')"},
+                    "y_mm": {"type": "number", "description": "Manual y offset (only when vert_orient='none')"},
+                    "back_transparent": {"type": "boolean", "default": True},
+                    "remove_borders": {"type": "boolean", "default": True},
+                },
+            },
+            "handler": lambda **kw: self.uno_bridge.insert_text_frame(**kw),
+        }
+
         self.tools["insert_image"] = {
             "description": "Insert an image from the given file path at `position` (or end of document). Optional width_mm/height_mm to size it.",
             "parameters": {"type": "object", "properties": {
@@ -843,16 +1028,56 @@ class LibreOfficeMCPServer:
             "handler": lambda table_name, cell, value:
                 self.uno_bridge.write_table_cell(table_name, cell, value),
         }
+        self.tools["read_table_rich"] = {
+            "description": (
+                "Return each cell of a table as a list of paragraphs with runs "
+                "(the same shape as get_paragraphs_with_runs entries). Use this "
+                "instead of read_table_cells when you need to replicate font / "
+                "bold / alignment / indent / line-spacing inside cells."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "table_name": {"type": "string"},
+                "table_index": {"type": "integer"},
+            }},
+            "handler": lambda table_name=None, table_index=None:
+                self.uno_bridge.read_table_rich(table_name, table_index),
+        }
+        self.tools["write_table_cell_rich"] = {
+            "description": (
+                "Write a list of paragraphs (with per-run formatting) into a "
+                "single cell. Accepts the structure read_table_rich emits "
+                "for that cell. Replaces existing cell contents. Use this to "
+                "faithfully replicate a table that has formatting inside cells."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "table_name": {"type": "string"},
+                "cell": {"type": "string"},
+                "paragraphs": {"type": "array", "items": {"type": "object"}},
+            }, "required": ["table_name", "cell", "paragraphs"]},
+            "handler": lambda table_name, cell, paragraphs:
+                self.uno_bridge.write_table_cell_rich(table_name, cell, paragraphs),
+        }
         self.tools["insert_table"] = {
-            "description": "Insert a new text table with given rows × columns at `position` (or end of doc).",
+            "description": (
+                "Insert a new text table with given rows × columns at "
+                "`position` (or end of doc). Pass column_widths_mm to "
+                "replicate non-uniform column widths from a source table — "
+                "without it all columns are equal width, narrow-text cells "
+                "get awkwardly wrapped (especially when ParaAdjust=block_line)."
+            ),
             "parameters": {"type": "object", "properties": {
                 "rows": {"type": "integer"},
                 "columns": {"type": "integer"},
                 "position": {"type": "integer"},
                 "name": {"type": "string"},
+                "column_widths_mm": {"type": "array", "items": {"type": "number"}},
+                "table_width_mm": {"type": "number"},
+                "split": {"type": "boolean"},
+                "repeat_headline": {"type": "boolean"},
+                "header_row_count": {"type": "integer"},
+                "keep_together": {"type": "boolean"},
             }, "required": ["rows", "columns"]},
-            "handler": lambda rows, columns, position=None, name=None:
-                self.uno_bridge.insert_table(rows, columns, position, name),
+            "handler": lambda **kw: self.uno_bridge.insert_table(**kw),
         }
         self.tools["remove_table"] = {
             "description": "Delete a table by name.",
@@ -1012,11 +1237,14 @@ class LibreOfficeMCPServer:
                 "round-trip. Each operation is {tool: <name>, args: {...}}. "
                 "Returns a parallel list of results in the same order. "
                 "By default wraps the whole batch in lockControllers / "
-                "unlockControllers so that view updates are deferred to the end "
-                "— this is REQUIRED on macOS for any batch >~30 write ops on a "
-                "visible doc, otherwise SolarMutex contention with the AppKit "
-                "main thread can deadlock LibreOffice. Set lock_view=false only "
-                "if you want intermediate states visible (e.g. progress demo)."
+                "unlockControllers so view updates are deferred to the end. "
+                "ALSO auto-detects 'heavy' operations (clone_page_style, "
+                "clone_paragraph_style, clone_numbering_rule, set_page_*_props, "
+                "set_paragraph_style_props) and TEMPORARILY hides the active "
+                "window for the duration of the batch, restoring visibility "
+                "afterwards — required on macOS, where AppKit paint cycles on a "
+                "visible doc can hold SolarMutex and deadlock the HTTP-worker. "
+                "Set lock_view=false / auto_hide=false to opt out (e.g. demos)."
             ),
             "parameters": {
                 "type": "object",
@@ -1035,11 +1263,13 @@ class LibreOfficeMCPServer:
                     "stop_on_error": {"type": "boolean", "default": False},
                     "lock_view": {"type": "boolean", "default": True,
                                   "description": "Freeze view updates during the batch (recommended)."},
+                    "auto_hide": {"type": "string", "default": "auto",
+                                  "description": "'auto' (hide if any heavy op present), 'always' (hide unconditionally), 'never' (do not hide). Window visibility restored after batch."},
                 },
                 "required": ["operations"],
             },
-            "handler": lambda operations, stop_on_error=False, lock_view=True:
-                self._execute_batch(operations, stop_on_error, lock_view),
+            "handler": lambda operations, stop_on_error=False, lock_view=True, auto_hide="auto":
+                self._execute_batch(operations, stop_on_error, lock_view, auto_hide),
         }
 
         self.tools["lock_view"] = {
@@ -1056,10 +1286,39 @@ class LibreOfficeMCPServer:
 
         logger.info(f"Registered {len(self.tools)} MCP tools")
 
-    def _execute_batch(self, operations, stop_on_error: bool = False, lock_view: bool = True):
+    # Operations known to mutate page-style / paragraph-style structures and
+    # hit the SolarMutex-paint deadlock on macOS when run on a visible doc.
+    _HEAVY_OPS = frozenset({
+        "clone_page_style", "clone_paragraph_style", "clone_numbering_rule",
+        "set_page_style_props", "set_paragraph_style_props",
+        "set_page_margins", "apply_paragraph_style",
+        "write_table_cell_rich",
+    })
+
+    def _execute_batch(self, operations, stop_on_error: bool = False,
+                       lock_view: bool = True, auto_hide="auto"):
         results = []
         ok = 0
         locked = False
+        # Decide whether to hide the window.
+        mode = str(auto_hide).lower() if auto_hide is not None else "auto"
+        if mode == "always":
+            should_hide = True
+        elif mode == "never" or mode in ("false", "0"):
+            should_hide = False
+        else:  # 'auto' / 'true' — detect heavy ops
+            should_hide = any(
+                isinstance(op, dict) and op.get("tool") in self._HEAVY_OPS
+                for op in operations
+            )
+        was_visible = None
+        if should_hide:
+            try:
+                hr = self.uno_bridge.hide_window()
+                if hr.get("success"):
+                    was_visible = bool(hr.get("was_visible", True))
+            except Exception:
+                was_visible = None
         if lock_view:
             try:
                 lr = self.uno_bridge.lock_view()
@@ -1094,11 +1353,14 @@ class LibreOfficeMCPServer:
                     break
         finally:
             if locked:
-                try:
-                    self.uno_bridge.unlock_view()
-                except Exception:
-                    pass
-        return {"success": True, "results": results, "ran": len(results), "ok": ok, "view_locked": locked}
+                try: self.uno_bridge.unlock_view()
+                except Exception: pass
+            if was_visible:
+                try: self.uno_bridge.show_window()
+                except Exception: pass
+        return {"success": True, "results": results, "ran": len(results), "ok": ok,
+                "view_locked": locked, "window_hidden": was_visible is not None,
+                "restored_visibility": bool(was_visible)}
     
     async def execute_tool(self, tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
         """
