@@ -108,12 +108,12 @@ winget install astral-sh.uv
 
 Скрипт идемпотентен — можно перезапускать.
 
-## Доступные MCP-инструменты (55)
+## Доступные MCP-инструменты (57)
 
 | Категория | Tools |
 |---|---|
 | Создание / открытие | `create_document_live`, `open_document_live`, `list_open_documents`, `list_recent_documents`, `open_recent_document` |
-| Чтение содержимого | `get_text_content_live`, `get_text_at`, `get_paragraphs`, `get_paragraph_format_at`, `get_character_format`, `get_selection`, `get_document_info_live`, `get_document_summary`, `get_document_metadata`, `get_page_info` |
+| Чтение содержимого | `get_text_content_live`, `get_text_at`, `get_paragraphs`, `get_paragraphs_with_runs`, `get_outline`, `get_paragraph_format_at`, `get_character_format`, `get_selection`, `get_document_info_live`, `get_document_summary`, `get_document_metadata`, `get_page_info` |
 | Стили | `list_paragraph_styles`, `list_character_styles`, `apply_paragraph_style` |
 | Поиск | `find_all`, `find_and_replace` |
 | Запись текста | `insert_text_live` (с поддержкой `\n` как paragraph break), `delete_range`, `select_range` |

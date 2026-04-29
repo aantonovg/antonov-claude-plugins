@@ -270,6 +270,30 @@ class LibreOfficeMCPServer:
             "handler": lambda position: self.uno_bridge.get_paragraph_format_at(position),
         }
 
+        self.tools["get_outline"] = {
+            "description": "Return the document outline — only headings (paragraphs with OutlineLevel>0 or 'Heading*'/'Title' style). Cheap way to build a TOC or section map without reading the whole body.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "max_level": {"type": "integer", "default": 10, "description": "Skip headings deeper than this level"},
+                },
+            },
+            "handler": lambda **kw: self.uno_bridge.get_outline(**kw),
+        }
+
+        self.tools["get_paragraphs_with_runs"] = {
+            "description": "Like get_paragraphs but also returns inline character runs per paragraph (text portions with uniform formatting): font, size, bold/italic/underline/strike, color, hyperlink URL, char style. Use this for faithful Markdown/HTML export when inline formatting matters.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start": {"type": "integer", "default": 0},
+                    "count": {"type": "integer", "description": "Max paragraphs to return (omit for all)"},
+                    "include_para_format": {"type": "boolean", "default": True},
+                },
+            },
+            "handler": lambda **kw: self.uno_bridge.get_paragraphs_with_runs(**kw),
+        }
+
         self.tools["get_character_format"] = {
             "description": "Read character formatting (font, size, bold/italic/underline, color, bg color) over a char range. Pass only `start` to read a single character.",
             "parameters": {

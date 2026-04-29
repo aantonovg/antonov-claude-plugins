@@ -617,6 +617,124 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def get_outline(self, max_level: int = 10) -> Dict[str, Any]:
+        """Return headings of the active Writer doc — paragraphs with OutlineLevel>0
+        or whose style name starts with 'Heading'/'Заголовок'/'Title'. Cheap way to
+        build a TOC without scanning the full body."""
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            out = []
+            for idx, (para, off, length) in enumerate(self._iter_paragraphs(doc)):
+                level = 0
+                try:
+                    level = int(getattr(para, "OutlineLevel", 0) or 0)
+                except Exception:
+                    level = 0
+                style = ""
+                try:
+                    style = para.ParaStyleName or ""
+                except Exception:
+                    pass
+                style_lc = style.lower()
+                heading_by_style = (
+                    style_lc.startswith("heading")
+                    or style_lc.startswith("заголовок")
+                    or style_lc == "title"
+                    or style_lc == "subtitle"
+                )
+                if level <= 0 and not heading_by_style:
+                    continue
+                if level > 0 and level > max_level:
+                    continue
+                # Derive level from style name if OutlineLevel is missing
+                if level <= 0 and heading_by_style:
+                    digits = "".join(c for c in style if c.isdigit())
+                    level = int(digits) if digits else 1
+                text = para.getString()
+                out.append({
+                    "index": idx,
+                    "level": level,
+                    "style": style,
+                    "start": off,
+                    "end": off + length,
+                    "text": text,
+                })
+            return {"success": True, "outline": out, "count": len(out)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_paragraphs_with_runs(self, start: int = 0, count: int = None,
+                                 include_para_format: bool = True) -> Dict[str, Any]:
+        """Like get_paragraphs but also returns inline character runs (text
+        portions with uniform formatting). Each run carries font, size,
+        bold/italic/underline, color, and hyperlink URL when present.
+        Use this for faithful Markdown/HTML export when inline formatting matters."""
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            out = []
+            for idx, (para, off, length) in enumerate(self._iter_paragraphs(doc)):
+                if idx < start:
+                    continue
+                if count is not None and len(out) >= count:
+                    break
+                entry = {
+                    "index": idx,
+                    "start": off,
+                    "end": off + length,
+                    "text": para.getString(),
+                }
+                if include_para_format:
+                    try:
+                        entry["style"] = para.ParaStyleName
+                        entry["outline_level"] = int(getattr(para, "OutlineLevel", 0) or 0)
+                        entry["alignment"] = ["left", "right", "justify", "center"][para.ParaAdjust] if para.ParaAdjust in (0,1,2,3) else str(para.ParaAdjust)
+                    except Exception as fe:
+                        entry["format_error"] = str(fe)
+                # Enumerate text portions inside the paragraph
+                runs = []
+                try:
+                    pen = para.createEnumeration()
+                    while pen.hasMoreElements():
+                        portion = pen.nextElement()
+                        try:
+                            ptype = getattr(portion, "TextPortionType", "Text")
+                        except Exception:
+                            ptype = "Text"
+                        s = portion.getString()
+                        if not s and ptype == "Text":
+                            continue
+                        run = {"type": ptype, "text": s}
+                        try:
+                            run["font_name"] = portion.CharFontName
+                            run["font_size"] = portion.CharHeight
+                            run["bold"] = portion.CharWeight >= 150
+                            run["italic"] = portion.CharPosture != 0
+                            run["underline"] = portion.CharUnderline != 0
+                            run["strike"] = bool(getattr(portion, "CharStrikeout", 0))
+                            run["color"] = self._int_to_hex(portion.CharColor)
+                            if getattr(portion, "CharBackColor", -1) not in (-1, 0xFFFFFFFF):
+                                run["background_color"] = self._int_to_hex(portion.CharBackColor)
+                            url = getattr(portion, "HyperLinkURL", "")
+                            if url:
+                                run["hyperlink"] = url
+                            cstyle = getattr(portion, "CharStyleName", "")
+                            if cstyle:
+                                run["char_style"] = cstyle
+                        except Exception as re:
+                            run["run_error"] = str(re)
+                        runs.append(run)
+                except Exception as ee:
+                    entry["runs_error"] = str(ee)
+                entry["runs"] = runs
+                out.append(entry)
+            return {"success": True, "paragraphs": out, "returned": len(out)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def get_character_format(self, start: int, end: int = None) -> Dict[str, Any]:
         """Read character format on [start, end). If end is None or end==start, samples one char at start."""
         doc, err = self._require_writer()
