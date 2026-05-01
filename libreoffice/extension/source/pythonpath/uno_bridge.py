@@ -2227,6 +2227,189 @@ class UNOBridge:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def get_page_layout(self) -> Dict[str, Any]:
+        """Map every body element (paragraph, table, table row, frame) to its
+        actual page using ViewCursor.getPage(). Each element gets start_page
+        and end_page; if they differ the element is split between pages
+        (paragraph wrapping, row split with Split=True, table spanning pages).
+
+        Returns:
+        - page_count
+        - elements: ordered list with start_page/end_page (and per-row split
+          info for tables)
+        - pages: inverse view — for each page, which elements touch it (with
+          is_start/is_end markers)
+        - frames: TextFrames mapped to their anchor page
+
+        Caveat: requires layout to be computed. If the document is hidden,
+        getPage() may return 0 until visibility is restored. Caller should
+        ensure the doc is visible (or call show_window first). Each lookup
+        does ctrl.select(range) which moves the visible selection — expect
+        a brief flicker on a visible window.
+        """
+        doc, err = self._require_writer()
+        if err:
+            return err
+        try:
+            ctrl = doc.getCurrentController()
+            vc = ctrl.getViewCursor()
+
+            def _page_of(rng):
+                if rng is None:
+                    return 0
+                try:
+                    ctrl.select(rng)
+                    p = vc.getPage()
+                    return int(p) if p else 0
+                except Exception:
+                    return 0
+
+            text = doc.getText()
+            enum = text.createEnumeration()
+            elements = []
+            para_idx = 0
+            offset = 0
+            while enum.hasMoreElements():
+                elem = enum.nextElement()
+                if elem.supportsService("com.sun.star.text.Paragraph"):
+                    s = elem.getString()
+                    sp = _page_of(elem.getStart())
+                    ep = _page_of(elem.getEnd()) if s else sp
+                    entry = {
+                        "kind": "paragraph",
+                        "index": para_idx,
+                        "start": offset,
+                        "end": offset + len(s),
+                        "preview": (s[:60] + ("…" if len(s) > 60 else "")),
+                        "start_page": sp,
+                        "end_page": ep,
+                    }
+                    if sp and ep and sp != ep:
+                        entry["spans_pages"] = True
+                    elements.append(entry)
+                    offset += len(s) + 1
+                    para_idx += 1
+                elif elem.supportsService("com.sun.star.text.TextTable"):
+                    try: tname = elem.getName()
+                    except Exception: tname = ""
+                    try:
+                        n_rows = elem.getRows().getCount()
+                        n_cols = elem.getColumns().getCount()
+                    except Exception:
+                        n_rows, n_cols = 0, 0
+                    rows_info = []
+                    t_sp = 0
+                    t_ep = 0
+                    for r in range(n_rows):
+                        try:
+                            first_cell = elem.getCellByPosition(0, r)
+                            last_cell = elem.getCellByPosition(n_cols - 1, r) if n_cols else first_cell
+                            rsp = _page_of(first_cell.getStart())
+                            rep = _page_of(last_cell.getEnd())
+                        except Exception:
+                            rsp = 0; rep = 0
+                        row_entry = {"row": r, "start_page": rsp, "end_page": rep}
+                        if rsp and rep and rsp != rep:
+                            row_entry["spans_pages"] = True
+                        rows_info.append(row_entry)
+                        if r == 0:
+                            t_sp = rsp
+                        t_ep = rep
+                    entry = {
+                        "kind": "table",
+                        "name": tname,
+                        "rows_count": n_rows,
+                        "columns_count": n_cols,
+                        "anchor_offset": offset,
+                        "start_page": t_sp,
+                        "end_page": t_ep,
+                        "rows": rows_info,
+                    }
+                    if t_sp and t_ep and t_sp != t_ep:
+                        entry["spans_pages"] = True
+                    elements.append(entry)
+                    try:
+                        s = elem.getString(); offset += len(s) + 1
+                    except Exception:
+                        offset += 1
+                else:
+                    try:
+                        s = elem.getString(); offset += len(s) + 1
+                    except Exception:
+                        offset += 1
+
+            # Frames mapped to anchor page
+            frames_by_page = []
+            try:
+                tf = doc.getTextFrames()
+                for i in range(tf.Count):
+                    f = tf.getByIndex(i)
+                    try:
+                        a = f.Anchor
+                    except Exception:
+                        a = None
+                    fp = _page_of(a) if a is not None else 0
+                    try: fname = f.Name
+                    except Exception: fname = ""
+                    frames_by_page.append({"name": fname, "page": fp})
+            except Exception:
+                pass
+
+            # Determine page count
+            page_count = 0
+            try:
+                page_count = int(doc.getPropertyValue("PageCount") or 0)
+            except Exception:
+                pass
+            if page_count == 0:
+                try:
+                    vc.jumpToLastPage()
+                    page_count = int(vc.getPage() or 0)
+                except Exception:
+                    pass
+            if page_count == 0:
+                for e in elements:
+                    page_count = max(page_count, e.get("end_page") or 0,
+                                     e.get("start_page") or 0)
+
+            # Inverse view: pages[]
+            pages = [{"page": n + 1, "contents": [], "frames": []}
+                     for n in range(page_count)]
+            for e in elements:
+                sp = e.get("start_page") or 0
+                ep = e.get("end_page") or 0
+                if sp == 0 or ep == 0:
+                    continue
+                for p in range(sp, ep + 1):
+                    if 1 <= p <= page_count:
+                        ref = {
+                            "kind": e["kind"],
+                            "is_start": p == sp,
+                            "is_end": p == ep,
+                            "spans_pages": bool(e.get("spans_pages")),
+                        }
+                        if e["kind"] == "paragraph":
+                            ref["index"] = e.get("index")
+                            ref["preview"] = e.get("preview")
+                        else:
+                            ref["name"] = e.get("name")
+                            ref["rows_count"] = e.get("rows_count")
+                        pages[p - 1]["contents"].append(ref)
+            for fr in frames_by_page:
+                p = fr.get("page") or 0
+                if 1 <= p <= page_count:
+                    pages[p - 1]["frames"].append({"name": fr.get("name")})
+
+            return {
+                "success": True,
+                "page_count": page_count,
+                "elements": elements,
+                "pages": pages,
+                "frames": frames_by_page,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def get_character_format(self, start: int, end: int = None) -> Dict[str, Any]:
         """Read character format on [start, end). If end is None or end==start, samples one char at start."""
         doc, err = self._require_writer()

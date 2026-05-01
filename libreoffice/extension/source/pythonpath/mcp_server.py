@@ -498,6 +498,26 @@ class LibreOfficeMCPServer:
             "handler": lambda **kw: self.uno_bridge.list_body_elements(**kw),
         }
 
+        self.tools["get_page_layout"] = {
+            "description": (
+                "Map every body element (paragraph, table, table row, frame) "
+                "to its actual page using ViewCursor.getPage(). Each element "
+                "gets start_page+end_page; if they differ, the element is "
+                "split between pages (paragraph wrapping multiple lines, "
+                "table row split with Split=True, whole table spanning "
+                "pages). Returns ordered 'elements' AND inverse 'pages[]' — "
+                "for each page the list of paragraphs/tables/frames touching "
+                "it with is_start/is_end/spans_pages markers. This is the "
+                "only tool that surfaces actual page breaks (UNO does not "
+                "expose them statically — they are layout-computed). "
+                "REQUIRES the document to be visible: hidden docs return 0 "
+                "from getPage(). Each lookup does ctrl.select(range) so a "
+                "visible window will flicker briefly."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+            "handler": lambda: self.uno_bridge.get_page_layout(),
+        }
+
         self.tools["get_character_format"] = {
             "description": "Read character formatting (font, size, bold/italic/underline, color, bg color, kerning, scale_width) over a char range. `kerning` is per-char extra horizontal spacing in 1/100 mm — Word imports often set non-zero kerning on individual portions (e.g. spaces between bold names) to widen justify rendering. Pass only `start` to read a single character.",
             "parameters": {

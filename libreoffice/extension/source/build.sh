@@ -8,7 +8,7 @@ set -e
 PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD_DIR="$(cd "$PLUGIN_DIR/.." && pwd)/build"
 EXTENSION_NAME="libreoffice-mcp-extension"
-VERSION="1.0.5"
+VERSION="1.0.6"
 
 echo "Building LibreOffice MCP Extension v${VERSION}"
 
