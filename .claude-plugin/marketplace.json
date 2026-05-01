@@ -6,8 +6,8 @@
     "url": "https://github.com/aantonovg"
   },
   "metadata": {
-    "description": "Public marketplace of Claude Code plugins by aantonovg.",
-    "version": "1.0.0"
+    "description": "Public marketplace of Claude Code and Codex plugins by aantonovg.",
+    "version": "1.0.1"
   },
   "plugins": [
     {
@@ -20,8 +20,8 @@
     {
       "name": "libreoffice",
       "source": "./libreoffice",
-      "version": "1.0.7",
-      "description": "Live LibreOffice Writer editing from Claude Code: 88 MCP tools talking to a LibreOffice extension over HTTP localhost:8765. v1.0.7 enriches get_page_layout with table_groups[] — adjacent ODT tables with matching column count are recognized as one logical 'split table' (ODT models a broken-across-pages table as two TextTable objects between which the layout engine redistributes rows when content shifts). v1.0.6: get_page_layout — every paragraph/table/row/frame mapped to its actual page via ViewCursor.getPage() with start_page/end_page/spans_pages markers (the only way to see real page breaks since UNO does not expose them statically). v1.0.5: read_paragraph_xml as escape hatch for fo:* attributes UNO hides. v1.0.4: list_body_elements/read_table_rich/write_table_cell_rich (preserves runs+column widths), set_paragraph_breaks (BreakType+PageDescName), set_paragraph_text_flow (widows/orphans/keep_with_next), char_height per paragraph, set_footer_page_number, frame anchor index. v1.0.3: full symmetric get/set for paragraph and page styles, clone_paragraph_style/clone_page_style/clone_numbering_rule for bulk replication, graceful shutdown_application. Includes libreoffice-word skill that auto-activates on .odt/.doc/.docx/.rtf.",
+      "version": "1.0.8",
+      "description": "Live LibreOffice Writer editing from Claude Code and Codex: 88 MCP tools talking to a LibreOffice extension over HTTP localhost:8765. v1.0.8 adds Codex plugin metadata and a dual-client MCP launcher compatible with Codex ${PLUGIN_ROOT} and Claude Code ${CLAUDE_PLUGIN_ROOT}. v1.0.7 enriches get_page_layout with table_groups[] — adjacent ODT tables with matching column count are recognized as one logical 'split table' (ODT models a broken-across-pages table as two TextTable objects between which the layout engine redistributes rows when content shifts). v1.0.6: get_page_layout — every paragraph/table/row/frame mapped to its actual page via ViewCursor.getPage() with start_page/end_page/spans_pages markers (the only way to see real page breaks since UNO does not expose them statically). v1.0.5: read_paragraph_xml as escape hatch for fo:* attributes UNO hides. v1.0.4: list_body_elements/read_table_rich/write_table_cell_rich (preserves runs+column widths), set_paragraph_breaks (BreakType+PageDescName), set_paragraph_text_flow (widows/orphans/keep_with_next), char_height per paragraph, set_footer_page_number, frame anchor index. v1.0.3: full symmetric get/set for paragraph and page styles, clone_paragraph_style/clone_page_style/clone_numbering_rule for bulk replication, graceful shutdown_application. Includes libreoffice-word skill that auto-activates on .odt/.doc/.docx/.rtf.",
       "keywords": ["libreoffice", "mcp", "writer", "odt", "docx", "office", "uno", "live-editing"]
     }
   ]

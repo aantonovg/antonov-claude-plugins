@@ -1,0 +1,44 @@
+{
+  "name": "libreoffice",
+  "version": "1.0.8",
+  "description": "Live LibreOffice Writer editing from Codex: MCP tools talking to a LibreOffice extension over HTTP localhost:8765.",
+  "author": {
+    "name": "Aleksandr Antonov",
+    "email": "antonov.guap@gmail.com",
+    "url": "https://github.com/aantonovg"
+  },
+  "homepage": "https://github.com/aantonovg/antonov-claude-plugins/tree/main/libreoffice",
+  "repository": "https://github.com/aantonovg/antonov-claude-plugins",
+  "license": "MIT",
+  "keywords": [
+    "libreoffice",
+    "mcp",
+    "writer",
+    "odt",
+    "docx",
+    "office",
+    "uno",
+    "live-editing"
+  ],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "LibreOffice",
+    "shortDescription": "Live-edit LibreOffice Writer documents from Codex",
+    "longDescription": "Connect Codex to an open LibreOffice Writer document through a local MCP bridge and LibreOffice extension. Supports live reading, formatting, tables, styles, headers, footers, document inspection, conversion, and safe batch editing workflows.",
+    "developerName": "Aleksandr Antonov",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/aantonovg/antonov-claude-plugins/tree/main/libreoffice",
+    "defaultPrompt": [
+      "Inspect the open LibreOffice document",
+      "Format this DOCX through LibreOffice",
+      "Convert this document with LibreOffice"
+    ],
+    "brandColor": "#18A303"
+  }
+}

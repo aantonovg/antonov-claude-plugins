@@ -1,13 +1,13 @@
 {
   "libreoffice-live": {
     "type": "stdio",
-    "command": "uv",
+    "command": "sh",
     "args": [
-      "run",
-      "--project",
-      "${CLAUDE_PLUGIN_ROOT}",
-      "python",
-      "${CLAUDE_PLUGIN_ROOT}/live_bridge.py"
+      "-lc",
+      "ROOT=\"$1\"; if [ -z \"$ROOT\" ] || [ \"$ROOT\" = '${PLUGIN_ROOT}' ]; then ROOT=\"$2\"; fi; if [ -z \"$ROOT\" ] || [ \"$ROOT\" = '${CLAUDE_PLUGIN_ROOT}' ]; then ROOT=\"$(pwd)\"; fi; cd \"$ROOT\" && exec uv run --project \"$ROOT\" python \"$ROOT/live_bridge.py\"",
+      "libreoffice-live",
+      "${PLUGIN_ROOT}",
+      "${CLAUDE_PLUGIN_ROOT}"
     ]
   }
 }

@@ -1,0 +1,20 @@
+{
+  "name": "antonov-claude-plugins",
+  "interface": {
+    "displayName": "Antonov Codex Plugins"
+  },
+  "plugins": [
+    {
+      "name": "libreoffice",
+      "source": {
+        "source": "local",
+        "path": "./libreoffice"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

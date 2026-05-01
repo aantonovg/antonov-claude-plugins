@@ -70,9 +70,42 @@ winget install astral-sh.uv
 2. Перезапусти Claude Code.
 3. Проверь: `claude mcp list` должен показать **`libreoffice-live: ✓ Connected`**.
 
-## Установка в Codex CLI
+## Установка в Codex
 
-В отличие от Claude Code, Codex не имеет marketplace для плагинов. Подключение делается **руками** через клон репозитория и редактирование конфига.
+Codex CLI умеет подключать кастомные marketplace-источники из GitHub. Добавь этот репозиторий как marketplace:
+
+```bash
+codex plugin marketplace add aantonovg/antonov-claude-plugins
+```
+
+После этого плагин `libreoffice` должен появиться в интерфейсе Codex среди доступных плагинов из marketplace `antonov-claude-plugins`.
+
+Если нужно обновить marketplace после нового push:
+
+```bash
+codex plugin marketplace upgrade antonov-claude-plugins
+```
+
+После установки плагина — **один раз** запустить `install.sh`, который ставит расширение в LibreOffice и (на macOS) делает ad-hoc re-sign:
+
+```bash
+~/.codex/plugins/cache/antonov-claude-plugins/libreoffice/*/scripts/install.sh
+```
+
+Если glob не сработает — найди реальный путь:
+
+```bash
+find ~/.codex -name "install.sh" -path "*libreoffice*" 2>/dev/null
+```
+
+После этого:
+1. Открой LibreOffice (расширение автоматически стартует HTTP API на :8765).
+2. Перезапусти Codex.
+3. Проверь, что MCP-сервер `libreoffice-live` подключился.
+
+### Ручное подключение в Codex CLI
+
+Если UI/marketplace в твоей версии Codex не показывает кастомный плагин, можно подключить MCP-сервер напрямую через клон репозитория и `~/.codex/config.toml`.
 
 1. Клонировать репозиторий:
    ```bash
@@ -96,7 +129,7 @@ winget install astral-sh.uv
      "/Users/YOURNAME/.codex-plugins/antonov-claude-plugins/libreoffice/live_bridge.py",
    ]
    ```
-   *(Замени `/Users/YOURNAME/...` на реальный абсолютный путь — Codex не подставляет `${CLAUDE_PLUGIN_ROOT}`.)*
+   *(Замени `/Users/YOURNAME/...` на реальный абсолютный путь — ручной MCP-конфиг Codex не подставляет `${CLAUDE_PLUGIN_ROOT}`.)*
 
 4. Открой LibreOffice, перезапусти Codex, проверь `codex mcp list` (или эквивалент в твоей версии — название команды менялось).
 

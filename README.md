@@ -1,8 +1,8 @@
 # antonov-claude-plugins
 
-Публичный маркетплейс плагинов для [Claude Code](https://claude.com/claude-code).
+Публичный маркетплейс плагинов для [Claude Code](https://claude.com/claude-code) и Codex.
 
-## Установка маркетплейса
+## Установка маркетплейса в Claude Code
 
 ```
 /plugin marketplace add aantonovg/antonov-claude-plugins
@@ -15,7 +15,7 @@
 | Плагин | Версия | Описание |
 |--------|--------|----------|
 | [sensortower](./sensortower) | 1.0.1 | Sensor Tower MCP — 85 инструментов app-intelligence: рейтинги, метаданные, выручка, ключевые слова, реклама. |
-| [libreoffice](./libreoffice) | 1.0.0 | Live-редактирование LibreOffice Writer из Claude Code: 55+ инструментов (параграфы, стили, find&replace, гиперссылки, комментарии, таблицы, headers/footers, undo/redo). |
+| [libreoffice](./libreoffice) | 1.0.8 | Live-редактирование LibreOffice Writer из Claude Code и Codex: MCP-инструменты для параграфов, стилей, таблиц, headers/footers, layout inspection и конвертации. |
 
 ## Установка плагина
 
@@ -27,6 +27,34 @@
 ```
 
 Альтернативно — через интерактивное меню `/plugin` → Discover → выбрать плагин.
+
+## Установка маркетплейса в Codex
+
+Codex CLI поддерживает кастомные marketplace-источники из GitHub:
+
+```bash
+codex plugin marketplace add aantonovg/antonov-claude-plugins
+```
+
+После этого marketplace появится в `~/.codex/config.toml` как секция `[marketplaces.antonov-claude-plugins]`, а плагины из `.agents/plugins/marketplace.json` будут доступны в интерфейсе Codex.
+
+Если UI не показывает кастомные плагины сразу, обнови marketplace и перезапусти Codex:
+
+```bash
+codex plugin marketplace upgrade antonov-claude-plugins
+```
+
+Для `libreoffice` после установки плагина нужно один раз поставить расширение LibreOffice:
+
+```bash
+~/.codex/plugins/cache/antonov-claude-plugins/libreoffice/*/scripts/install.sh
+```
+
+Если путь отличается, найди installed copy:
+
+```bash
+find ~/.codex -name "install.sh" -path "*libreoffice*" 2>/dev/null
+```
 
 Все плагины используют [`uv`](https://docs.astral.sh/uv/) — поставь его сначала:
 
@@ -82,9 +110,14 @@ setx SENSORTOWER_API_KEY "..."
 
 ```
 .
+├── .agents/
+│   └── plugins/
+│       └── marketplace.json # манифест маркетплейса Codex
 ├── .claude-plugin/
 │   └── marketplace.json     # манифест маркетплейса
 └── <plugin-name>/
+    ├── .codex-plugin/
+    │   └── plugin.json      # манифест плагина Codex
     ├── .claude-plugin/
     │   └── plugin.json      # манифест плагина
     ├── .mcp.json            # (опц.) MCP-серверы плагина
