@@ -1,5 +1,10 @@
 {
   "name": "libreoffice",
-  "version": "1.0.8",
-  "description": "Live LibreOffice Writer editing from Claude Code and Codex: 70+ MCP tools with symmetric read+write for paragraphs (text-flow, breaks, char_height), tables (rich cells with column widths, split, repeat headline), text frames (per-page numbering), page styles (Word-import MP* master pages, header/footer, line spacing, tab stops, context margin); get_page_layout maps every paragraph/row/frame to its actual page (with split detection) and groups adjacent ODT-split tables as one logical table; clone_paragraph_style/clone_page_style/clone_numbering_rule for fast bulk replication; read_paragraph_xml as escape hatch for fo:* attributes UNO hides; batch + view-lock + auto_hide for SolarMutex-safe bursts; graceful shutdown_application (no recovery dialog). Includes libreoffice-word skill that auto-activates on Word/ODT formats. Talks to a LibreOffice extension that runs an HTTP API at localhost:8765 inside the editor."
+  "version": "1.0.9",
+  "author": {
+    "name": "Aleksandr Antonov",
+    "email": "antonov.guap@gmail.com",
+    "url": "https://github.com/aantonovg"
+  },
+  "description": "Live LibreOffice Writer editing from Claude Code and Codex: 70+ MCP tools with symmetric read+write for paragraphs (text-flow, breaks, char_height), tables (rich cells with column widths, split, repeat headline), text frames (per-page numbering), page styles (Word-import MP* master pages, header/footer, line spacing, tab stops, context margin); get_page_layout maps every paragraph/row/frame to its actual page (with split detection) and groups adjacent ODT-split tables as one logical table; clone_paragraph_style/clone_page_style/clone_numbering_rule for fast bulk replication; read_paragraph_xml as escape hatch for fo:* attributes UNO hides; batch + view-lock + auto_hide for SolarMutex-safe bursts; graceful shutdown_application (no recovery dialog). v1.0.9 fixes Codex MCP discovery by using the canonical top-level mcpServers shape and a more robust plugin-root fallback. Includes libreoffice-word skill that auto-activates on Word/ODT formats. Talks to a LibreOffice extension that runs an HTTP API at localhost:8765 inside the editor."
 }

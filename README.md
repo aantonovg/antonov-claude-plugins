@@ -15,7 +15,7 @@
 | Плагин | Версия | Описание |
 |--------|--------|----------|
 | [sensortower](./sensortower) | 1.0.1 | Sensor Tower MCP — 85 инструментов app-intelligence: рейтинги, метаданные, выручка, ключевые слова, реклама. |
-| [libreoffice](./libreoffice) | 1.0.8 | Live-редактирование LibreOffice Writer из Claude Code и Codex: MCP-инструменты для параграфов, стилей, таблиц, headers/footers, layout inspection и конвертации. |
+| [libreoffice](./libreoffice) | 1.0.9 | Live-редактирование LibreOffice Writer из Claude Code и Codex: MCP-инструменты для параграфов, стилей, таблиц, headers/footers, layout inspection и конвертации. |
 
 ## Установка плагина
 

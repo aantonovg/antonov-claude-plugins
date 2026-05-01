@@ -1,6 +1,6 @@
 {
   "name": "libreoffice",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "Live LibreOffice Writer editing from Codex: MCP tools talking to a LibreOffice extension over HTTP localhost:8765.",
   "author": {
     "name": "Aleksandr Antonov",

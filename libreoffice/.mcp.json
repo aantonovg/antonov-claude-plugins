@@ -1,13 +1,15 @@
 {
-  "libreoffice-live": {
-    "type": "stdio",
-    "command": "sh",
-    "args": [
-      "-lc",
-      "ROOT=\"$1\"; if [ -z \"$ROOT\" ] || [ \"$ROOT\" = '${PLUGIN_ROOT}' ]; then ROOT=\"$2\"; fi; if [ -z \"$ROOT\" ] || [ \"$ROOT\" = '${CLAUDE_PLUGIN_ROOT}' ]; then ROOT=\"$(pwd)\"; fi; cd \"$ROOT\" && exec uv run --project \"$ROOT\" python \"$ROOT/live_bridge.py\"",
-      "libreoffice-live",
-      "${PLUGIN_ROOT}",
-      "${CLAUDE_PLUGIN_ROOT}"
-    ]
+  "mcpServers": {
+    "libreoffice-live": {
+      "type": "stdio",
+      "command": "sh",
+      "args": [
+        "-lc",
+        "ROOT=\"$1\"; if [ -z \"$ROOT\" ] || [ \"$ROOT\" = '${PLUGIN_ROOT}' ]; then ROOT=\"$2\"; fi; if [ -z \"$ROOT\" ] || [ \"$ROOT\" = '${CLAUDE_PLUGIN_ROOT}' ]; then ROOT=\"$(pwd)\"; fi; if [ ! -f \"$ROOT/live_bridge.py\" ] && [ -f \"$ROOT/libreoffice/live_bridge.py\" ]; then ROOT=\"$ROOT/libreoffice\"; fi; if [ ! -f \"$ROOT/live_bridge.py\" ]; then BRIDGE=\"$(find \"${CODEX_HOME:-$HOME/.codex}/plugins/cache\" \"$HOME/.claude/plugins/cache\" -path '*/libreoffice/*/live_bridge.py' -print -quit 2>/dev/null)\"; ROOT=\"${BRIDGE%/live_bridge.py}\"; fi; cd \"$ROOT\" && exec uv run --project \"$ROOT\" python \"$ROOT/live_bridge.py\"",
+        "libreoffice-live",
+        "${PLUGIN_ROOT}",
+        "${CLAUDE_PLUGIN_ROOT}"
+      ]
+    }
   }
 }
