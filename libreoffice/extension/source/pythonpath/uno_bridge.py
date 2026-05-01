@@ -2372,6 +2372,74 @@ class UNOBridge:
                     page_count = max(page_count, e.get("end_page") or 0,
                                      e.get("start_page") or 0)
 
+            # Detect logical table groups: sequences of adjacent tables with
+            # matching columns_count, separated only by empty paragraphs (or
+            # nothing). ODT models a "split table" as two TextTable objects
+            # — when the user edits text, the layout engine re-distributes
+            # rows between them but keeps them as separate XML tables. This
+            # heuristic surfaces them as one "logical" table for callers.
+            table_groups = []
+            i = 0
+            while i < len(elements):
+                if elements[i].get("kind") == "table":
+                    grp = [i]
+                    j = i + 1
+                    while j < len(elements):
+                        ej = elements[j]
+                        if ej.get("kind") == "table":
+                            if (ej.get("columns_count") ==
+                                elements[grp[-1]].get("columns_count")
+                                and ej.get("columns_count")):
+                                grp.append(j)
+                                j += 1
+                                continue
+                            break
+                        elif ej.get("kind") == "paragraph":
+                            # Allow only empty paragraphs between tables
+                            preview = (ej.get("preview") or "").strip()
+                            if preview:
+                                break
+                            j += 1
+                            continue
+                        else:
+                            break
+                    if len(grp) > 1:
+                        gid = f"tgroup_{len(table_groups) + 1}"
+                        cum_row = 0
+                        members = []
+                        for pos, idx in enumerate(grp):
+                            t = elements[idx]
+                            t["group_id"] = gid
+                            t["group_position"] = pos + 1
+                            t["group_size"] = len(grp)
+                            t["group_row_offset"] = cum_row
+                            # Stamp each row with its index in the merged table
+                            for r in t.get("rows", []):
+                                r["group_row_index"] = cum_row
+                                cum_row += 1
+                            members.append({
+                                "name": t.get("name"),
+                                "position": pos + 1,
+                                "rows_count": t.get("rows_count", 0),
+                                "start_page": t.get("start_page"),
+                                "end_page": t.get("end_page"),
+                            })
+                        sp = elements[grp[0]].get("start_page", 0)
+                        ep = elements[grp[-1]].get("end_page", 0)
+                        table_groups.append({
+                            "group_id": gid,
+                            "tables": [elements[k].get("name") for k in grp],
+                            "members": members,
+                            "total_rows": cum_row,
+                            "columns_count": elements[grp[0]].get("columns_count"),
+                            "start_page": sp,
+                            "end_page": ep,
+                            "spans_pages": bool(sp and ep and sp != ep),
+                        })
+                    i = j if len(grp) > 1 else i + 1
+                else:
+                    i += 1
+
             # Inverse view: pages[]
             pages = [{"page": n + 1, "contents": [], "frames": []}
                      for n in range(page_count)]
@@ -2394,6 +2462,10 @@ class UNOBridge:
                         else:
                             ref["name"] = e.get("name")
                             ref["rows_count"] = e.get("rows_count")
+                            if e.get("group_id"):
+                                ref["group_id"] = e["group_id"]
+                                ref["group_position"] = e.get("group_position")
+                                ref["group_size"] = e.get("group_size")
                         pages[p - 1]["contents"].append(ref)
             for fr in frames_by_page:
                 p = fr.get("page") or 0
@@ -2406,6 +2478,7 @@ class UNOBridge:
                 "elements": elements,
                 "pages": pages,
                 "frames": frames_by_page,
+                "table_groups": table_groups,
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
